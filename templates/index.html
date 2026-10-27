@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>NVR Web Viewer</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 15px;
+            background: #181818;
+            color: white;
+            height: 100vh;
+            display: flex;
+            gap: 15px;
+            overflow: hidden;
+        }
+        /* Lewy panel boczny */
+        .sidebar {
+            width: 300px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            height: 100%;
+            overflow-y: auto;
+        }
+        .panel {
+            padding: 14px;
+            background: #242424;
+            border: 1px solid #3d3d3d;
+            border-radius: 6px;
+        }
+        .panel h3 {
+            margin: 0 0 12px 0;
+            font-size: 15px;
+            color: #e0e0e0;
+            border-bottom: 1px solid #3a3a3a;
+            padding-bottom: 8px;
+        }
+        /* Lista kontrolerów (NVR) */
+        .nvr-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 280px;
+            overflow-y: auto;
+        }
+        .nvr-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 10px;
+            background: #2f2f2f;
+            border: 1px solid #444;
+            border-radius: 5px;
+            cursor: pointer;
+            user-select: none;
+            transition: background 0.15s, border-color 0.15s;
+        }
+        .nvr-item:hover {
+            background: #383838;
+        }
+        .nvr-item.active {
+            background: #1e3a2f;
+            border-color: #4CAF50;
+        }
+        .nvr-item input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: #4CAF50;
+            cursor: pointer;
+            margin: 0;
+        }
+        .nvr-info {
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .nvr-title {
+            font-weight: bold;
+            font-size: 14px;
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .nvr-meta {
+            font-size: 12px;
+            color: #aaa;
+        }
+        /* Przyciski układu */
+        .grid-buttons {
+            display: flex;
+            gap: 8px;
+        }
+        .grid-buttons button {
+            flex: 1;
+            padding: 8px 0;
+            font-weight: bold;
+        }
+        .grid-buttons button.active {
+            background: #2196F3;
+            color: white;
+        }
+        /* Formularz dodawania NVR */
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #555;
+            border-radius: 4px;
+            background: #333;
+            color: white;
+        }
+        button {
+            padding: 8px 14px;
+            cursor: pointer;
+            border: none;
+            border-radius: 4px;
+            background: #444;
+            color: white;
+        }
+        button:hover { background: #555; }
+        .btn-success { background: #4CAF50; font-weight: bold; width: 100%; margin-top: 4px; }
+        .btn-success:hover { background: #45a049; }
+
+        /* Prawa część – siatka wideo */
+        .main-area {
+            flex-grow: 1;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+        .video-grid {
+            display: grid;
+            gap: 10px;
+            width: 100%;
+            height: 100%;
+        }
+        .grid-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+        .grid-4 { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr); }
+        .grid-16 { grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(4, 1fr); }
+        .video-cell {
+            background: #000;
+            border: 1px solid #444;
+            border-radius: 4px;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .cell-header {
+            background: #222;
+            padding: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #444;
+            gap: 6px;
+        }
+        .cell-header select {
+            padding: 4px;
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            border-radius: 3px;
+            width: 100%;
+            min-width: 0;
+        }
+        .btn-hq {
+            padding: 3px 8px;
+            font-size: 11px;
+            font-weight: bold;
+            background: #333;
+            color: #888;
+            border: 1px solid #555;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        .btn-hq:hover { background: #444; color: #ccc; }
+        .btn-hq.active { background: #2196F3; color: white; border-color: #64B5F6; }
+        .cell-status {
+            font-size: 12px;
+            color: #aaa;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+        .video-container { flex-grow: 1; position: relative; }
+        video { width: 100%; height: 100%; object-fit: contain; position: absolute; top: 0; left: 0; }
+    </style>
+</head>
+<body>
+
+<aside class="sidebar">
+    <div class="panel">
+        <h3>Kontrolery (Rejestratory)</h3>
+        <div id="nvr-list" class="nvr-list">
+            <div style="color: #888; font-size: 13px;">Ładowanie...</div>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h3>Układ siatki</h3>
+        <div class="grid-buttons">
+            <button id="grid-btn-1" onclick="setGrid(1)">1x1</button>
+            <button id="grid-btn-4" class="active" onclick="setGrid(4)">2x2</button>
+            <button id="grid-btn-16" onclick="setGrid(16)">4x4</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h3>Dodaj rejestrator</h3>
+        <div class="form-group">
+            <input type="text" id="nvr-name" placeholder="Nazwa robocza (np. 103)" required>
+            <input type="text" id="nvr-ip" placeholder="Adres IP" required>
+            <input type="number" id="nvr-port" placeholder="Port" value="34567" required>
+            <input type="text" id="nvr-user" placeholder="Użytkownik" value="admin" required>
+            <input type="password" id="nvr-pass" placeholder="Hasło" required>
+            <button class="btn-success" onclick="addDVR()">Testuj połączenie i Zapisz</button>
+        </div>
+    </div>
+</aside>
+
+<main class="main-area">
+    <div id="grid" class="video-grid grid-4"></div>
+</main>
+
+<script>
+    let dvrDatabase = [];
+    let currentGridCount = 4;
+    const enabledDvrIds = new Set();     // ID włączonych kontrolerów z lewego panelu
+    const activePeerConnections = {};    // cellIndex -> RTCPeerConnection
+    const cellStreamQuality = {};        // cellIndex -> 2 (SD) lub 1 (HQ)
+    const cellActiveSelection = {};      // cellIndex -> { key: "dvrId:channel", label: "..." }
+
+    window.onload = async () => {
+        setGrid(4);
+        await refreshDvrList(true);
+    };
+
+    async function refreshDvrList(enableAllOnInit = false) {
+        const response = await fetch('/api/dvrs');
+        dvrDatabase = await response.json();
+
+        if (enableAllOnInit) {
+            dvrDatabase.forEach(dvr => enabledDvrIds.add(dvr.id));
+        }
+
+        renderNvrSidebar();
+        updateChannelSelectors();
+    }
+
+    function renderNvrSidebar() {
+        const listEl = document.getElementById('nvr-list');
+        if (!dvrDatabase.length) {
+            listEl.innerHTML = '<div style="color: #888; font-size: 13px;">Brak zapisanych rejestratorów.</div>';
+            return;
+        }
+
+        listEl.innerHTML = '';
+        dvrDatabase.forEach(dvr => {
+            const isChecked = enabledDvrIds.has(dvr.id);
+            const chCount = dvr.channels ? dvr.channels.length : 0;
+
+            const item = document.createElement('div');
+            item.className = `nvr-item ${isChecked ? 'active' : ''}`;
+            item.onclick = (e) => {
+                if (e.target.tagName !== 'INPUT') {
+                    toggleNvrSelection(dvr.id);
+                }
+            };
+
+            item.innerHTML = `
+                <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleNvrSelection(${dvr.id})">
+                <div class="nvr-info">
+                    <span class="nvr-title">${dvr.name}</span>
+                    <span class="nvr-meta">${dvr.ip} • ${chCount} kam.</span>
+                </div>
+            `;
+            listEl.appendChild(item);
+        });
+    }
+
+    function toggleNvrSelection(dvrId) {
+        if (enabledDvrIds.has(dvrId)) {
+            enabledDvrIds.delete(dvrId);
+        } else {
+            enabledDvrIds.add(dvrId);
+        }
+        renderNvrSidebar();
+        // Aktualizujemy wyłącznie listy wyboru w kafelkach – NIE resetujemy aktywnych strumieni!
+        updateChannelSelectors();
+    }
+
+    async function addDVR() {
+        const name = document.getElementById('nvr-name').value.trim();
+        const ip = document.getElementById('nvr-ip').value.trim();
+        const port = parseInt(document.getElementById('nvr-port').value);
+        const user = document.getElementById('nvr-user').value.trim();
+        const password = document.getElementById('nvr-pass').value;
+        if (!name || !ip || !port || !user) return alert("Wypełnij wymagane pola!");
+
+        const payload = { name, ip, port, user, password };
+        const testRes = await fetch('/api/dvrs/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        
+        if (!testRes.ok) {
+            const err = await testRes.json();
+            return alert(`Błąd połączenia: ${err.detail}`);
+        }
+
+        const saveRes = await fetch('/api/dvrs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (saveRes.ok) {
+            const data = await saveRes.json();
+            document.getElementById('nvr-pass').value = '';
+            enabledDvrIds.add(data.dvr_id);
+            await refreshDvrList(false);
+            alert(`Połączenie udane. Zapisano rejestrator oraz pobrano ${data.channels_count} kanałów!`);
+        } else {
+            const err = await saveRes.json();
+            alert(`Błąd zapisu: ${err.detail}`);
+        }
+    }
+
+    function buildChannelOptionsForCell(cellIndex) {
+        const currentSel = cellActiveSelection[cellIndex];
+        const activeDvrs = dvrDatabase.filter(d => enabledDvrIds.has(d.id));
+
+        let html = '<option value="">-- Wybierz kamerę --</option>';
+        let currentIncluded = false;
+
+        activeDvrs.forEach(dvr => {
+            if (!dvr.channels || !dvr.channels.length) return;
+            html += `<optgroup label="Rejestrator: ${dvr.name} (${dvr.ip})">`;
+            dvr.channels.forEach(ch => {
+                const val = `${dvr.id}:${ch.channel_number}`;
+                const label = `[${dvr.name}] Kanał ${ch.channel_number}: ${ch.name}`;
+                const isSelected = currentSel && currentSel.key === val;
+                if (isSelected) currentIncluded = true;
+                html += `<option value="${val}" ${isSelected ? 'selected' : ''}>${label}</option>`;
+            });
+            html += `</optgroup>`;
+        });
+
+        // Jeśli w tym kafelku gra kamera z kontrolera, który został właśnie odznaczony na liście po lewej,
+        // zachowujemy tę opcję jako wybraną, aby nie przerywać odtwarzania wideo!
+        if (currentSel && currentSel.key && !currentIncluded) {
+            html = `<option value="${currentSel.key}" selected>${currentSel.label}</option>` + html;
+        }
+
+        return html;
+    }
+
+    function updateChannelSelectors() {
+        for (let i = 0; i < currentGridCount; i++) {
+            const selectEl = document.getElementById(`channel-select-${i}`);
+            if (selectEl) {
+                selectEl.innerHTML = buildChannelOptionsForCell(i);
+            }
+        }
+    }
+
+    function closeCellConnection(cellIndex) {
+        if (activePeerConnections[cellIndex]) {
+            try { activePeerConnections[cellIndex].close(); } catch (e) {}
+            delete activePeerConnections[cellIndex];
+        }
+    }
+
+    function setGrid(count) {
+        // Aktualizacja podświetlenia przycisku siatki
+        [1, 4, 16].forEach(c => {
+            const btn = document.getElementById(`grid-btn-${c}`);
+            if (btn) btn.classList.toggle('active', c === count);
+        });
+
+        const grid = document.getElementById('grid');
+        grid.className = 'video-grid';
+        if (count === 1) grid.classList.add('grid-1');
+        if (count === 4) grid.classList.add('grid-4');
+        if (count === 16) grid.classList.add('grid-16');
+
+        // Zamykamy połączenia kafelków, które znikają przy zmniejszeniu siatki
+        for (let i = count; i < currentGridCount; i++) {
+            closeCellConnection(i);
+        }
+
+        // Dodajemy brakujące kafelki lub usuwamy nadmiarowe, zachowując już grające kafelki!
+        for (let i = currentGridCount - 1; i >= count; i--) {
+            const cell = document.getElementById(`cell-${i}`);
+            if (cell) cell.remove();
+        }
+
+        const existingCells = grid.children.length;
+        for (let i = existingCells; i < count; i++) {
+            if (!cellStreamQuality[i]) cellStreamQuality[i] = 2;
+            const isHq = cellStreamQuality[i] === 1;
+            const cellDiv = document.createElement('div');
+            cellDiv.className = 'video-cell';
+            cellDiv.id = `cell-${i}`;
+            cellDiv.innerHTML = `
+                <div class="cell-header">
+                    <select id="channel-select-${i}" onchange="onCellSelectChange(${i}, this)">
+                        ${buildChannelOptionsForCell(i)}
+                    </select>
+                    <button class="btn-hq ${isHq ? 'active' : ''}" id="hq-btn-${i}" onclick="toggleHQ(${i})" title="Przełącz jakość: Strumień zapasowy (SD) / Główny (HQ)">HQ</button>
+                    <span class="cell-status" id="status-${i}"></span>
+                </div>
+                <div class="video-container" id="video-container-${i}"></div>
+            `;
+            grid.appendChild(cellDiv);
+
+            // Jeśli dla tego kafelka była wcześniej wybrana kamera, wznawiamy ją
+            if (cellActiveSelection[i] && cellActiveSelection[i].key) {
+                loadChannelToCell(i, cellActiveSelection[i].key);
+            }
+        }
+
+        currentGridCount = count;
+        updateChannelSelectors();
+    }
+
+    function onCellSelectChange(cellIndex, selectEl) {
+        const val = selectEl.value;
+        if (!val) {
+            delete cellActiveSelection[cellIndex];
+        } else {
+            const selectedOption = selectEl.options[selectEl.selectedIndex];
+            cellActiveSelection[cellIndex] = {
+                key: val,
+                label: selectedOption ? selectedOption.textContent : val
+            };
+        }
+        loadChannelToCell(cellIndex, val);
+    }
+
+    function toggleHQ(cellIndex) {
+        const current = cellStreamQuality[cellIndex] || 2;
+        const next = current === 2 ? 1 : 2;
+        cellStreamQuality[cellIndex] = next;
+
+        const btn = document.getElementById(`hq-btn-${cellIndex}`);
+        if (btn) {
+            btn.classList.toggle('active', next === 1);
+        }
+
+        const sel = cellActiveSelection[cellIndex];
+        if (sel && sel.key) {
+            loadChannelToCell(cellIndex, sel.key);
+        }
+    }
+
+    async function loadChannelToCell(cellIndex, compositeVal) {
+        closeCellConnection(cellIndex);
+        const container = document.getElementById(`video-container-${cellIndex}`);
+        const statusEl = document.getElementById(`status-${cellIndex}`);
+
+        if (!compositeVal || !compositeVal.includes(':')) {
+            if (container) container.innerHTML = '';
+            if (statusEl) statusEl.textContent = '';
+            return;
+        }
+
+        const [dvrIdStr, channelStr] = compositeVal.split(':');
+        const dvrId = parseInt(dvrIdStr);
+        const channel = parseInt(channelStr);
+        const stream = cellStreamQuality[cellIndex] || 2;
+
+        if (!dvrId || !channel) {
+            container.innerHTML = '';
+            if (statusEl) statusEl.textContent = '';
+            return;
+        }
+
+        container.innerHTML = `<video id="video-${cellIndex}" autoplay muted playsinline controls></video>`;
+        if (statusEl) statusEl.textContent = stream === 1 ? 'Łączenie HQ...' : 'Łączenie...';
+        await startWebRTC(cellIndex, dvrId, channel, stream);
+    }
+
+    function waitForIceGathering(pc, timeoutMs = 400) {
+        return new Promise((resolve) => {
+            if (pc.iceGatheringState === 'complete') {
+                return resolve();
+            }
+            const timer = setTimeout(() => {
+                pc.removeEventListener('icegatheringstatechange', checkState);
+                resolve();
+            }, timeoutMs);
+            function checkState() {
+                if (pc.iceGatheringState === 'complete') {
+                    clearTimeout(timer);
+                    pc.removeEventListener('icegatheringstatechange', checkState);
+                    resolve();
+                }
+            }
+            pc.addEventListener('icegatheringstatechange', checkState);
+        });
+    }
+
+    function fallbackToMp4Stream(cellIndex, dvrId, channel, stream) {
+        closeCellConnection(cellIndex);
+        const video = document.getElementById(`video-${cellIndex}`);
+        const statusEl = document.getElementById(`status-${cellIndex}`);
+        if (!video) return;
+        if (statusEl) statusEl.textContent = stream === 1 ? '🟢 Live HQ' : '🟢 Live';
+        video.srcObject = null;
+        video.src = `/api/stream.mp4?dvr_id=${dvrId}&channel=${channel}&stream=${stream}`;
+        video.play().catch(() => {});
+    }
+
+    async function startWebRTC(cellIndex, dvrId, channel, stream = 2) {
+        const video = document.getElementById(`video-${cellIndex}`);
+        const statusEl = document.getElementById(`status-${cellIndex}`);
+        const pc = new RTCPeerConnection();
+        activePeerConnections[cellIndex] = pc;
+        let receivedFrames = false;
+
+        const fallbackTimer = setTimeout(() => {
+            if (!receivedFrames && activePeerConnections[cellIndex] === pc) {
+                fallbackToMp4Stream(cellIndex, dvrId, channel, stream);
+            }
+        }, 5000);
+
+        video.onplaying = () => {
+            receivedFrames = true;
+            clearTimeout(fallbackTimer);
+            if (statusEl) statusEl.textContent = stream === 1 ? '🟢 Live HQ' : '🟢 Live';
+        };
+
+        pc.ontrack = (event) => {
+            if (video.srcObject !== event.streams[0]) {
+                video.srcObject = event.streams[0];
+            }
+        };
+
+        pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+                clearTimeout(fallbackTimer);
+                fallbackToMp4Stream(cellIndex, dvrId, channel, stream);
+            }
+        };
+
+        pc.addTransceiver("video", { direction: "recvonly" });
+
+        try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            await waitForIceGathering(pc, 400);
+
+            const res = await fetch('/api/webrtc', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    dvr_id: dvrId,
+                    channel: channel,
+                    sdp: pc.localDescription.sdp,
+                    stream: stream
+                })
+            });
+
+            if (!res.ok) {
+                clearTimeout(fallbackTimer);
+                if (statusEl) statusEl.textContent = '🔴 Offline';
+                return;
+            }
+
+            const answer = await res.json();
+            await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        } catch (err) {
+            clearTimeout(fallbackTimer);
+            fallbackToMp4Stream(cellIndex, dvrId, channel, stream);
+        }
+    }
+</script>
+</body>
+</html>
