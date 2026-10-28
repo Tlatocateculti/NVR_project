@@ -16,7 +16,8 @@
             gap: 15px;
             overflow: hidden;
         }
-        /* Lewy panel boczny */
+
+        /* Lewy niezależny panel boczny – Kontrolery */
         .sidebar {
             width: 300px;
             flex-shrink: 0;
@@ -39,6 +40,7 @@
             border-bottom: 1px solid #3a3a3a;
             padding-bottom: 8px;
         }
+
         /* Lista kontrolerów (NVR) */
         .nvr-list {
             display: flex;
@@ -90,7 +92,8 @@
             font-size: 12px;
             color: #aaa;
         }
-        /* Przyciski układu */
+
+        /* Przyciski układu siatki */
         .grid-buttons {
             display: flex;
             gap: 8px;
@@ -104,6 +107,7 @@
             background: #2196F3;
             color: white;
         }
+
         /* Formularz dodawania NVR */
         .form-group {
             display: flex;
@@ -125,19 +129,75 @@
             border-radius: 4px;
             background: #444;
             color: white;
+            transition: background 0.15s;
         }
         button:hover { background: #555; }
-        .btn-success { background: #4CAF50; font-weight: bold; width: 100%; margin-top: 4px; }
-        .btn-success:hover { background: #45a049; }
+        .btn-success { background: #2e7d32; font-weight: bold; width: 100%; margin-top: 4px; }
+        .btn-success:hover { background: #388e3c; }
 
-        /* Prawa część – siatka wideo */
+        /* Prawa część główna – Zakładki + Widoki */
         .main-area {
             flex-grow: 1;
             height: 100%;
             display: flex;
             flex-direction: column;
             min-width: 0;
+            gap: 0;
         }
+
+        /* Styl zakładek przeglądarkowych */
+        .tabs-nav {
+            display: flex;
+            gap: 6px;
+            background: #181818;
+            border-bottom: 2px solid #2f2f2f;
+            padding: 0 4px;
+            flex-shrink: 0;
+        }
+        .tab-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 20px;
+            background: #262626;
+            color: #aaa;
+            border: 1px solid #383838;
+            border-bottom: none;
+            border-radius: 8px 8px 0 0;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.15s, color 0.15s;
+            user-select: none;
+        }
+        .tab-btn:hover {
+            background: #323232;
+            color: #eee;
+        }
+        .tab-btn.active {
+            background: #242424;
+            color: #fff;
+            border-color: #444;
+            border-top: 3px solid #2196F3;
+            font-weight: bold;
+        }
+
+        /* Kontener widoków */
+        .views-container {
+            flex-grow: 1;
+            min-height: 0;
+            position: relative;
+            background: #1c1c1c;
+            border: 1px solid #2f2f2f;
+            border-top: none;
+            border-radius: 0 0 6px 6px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Widok 1: Siatka kamer Live */
         .video-grid {
             display: grid;
             gap: 10px;
@@ -194,10 +254,88 @@
         }
         .video-container { flex-grow: 1; position: relative; }
         video { width: 100%; height: 100%; object-fit: contain; position: absolute; top: 0; left: 0; }
+
+        /* Widok 2: Nagrania */
+        #view-recordings {
+            display: none;
+            width: 100%;
+            height: 100%;
+            flex-direction: column;
+            gap: 12px;
+            overflow: hidden;
+        }
+
+        /* Styl kalendarza */
+        .cal-day-cell {
+            aspect-ratio: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #2a2a2a;
+            border: 1px solid #383838;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            user-select: none;
+            transition: background 0.15s, border-color 0.15s;
+        }
+        .cal-day-cell:hover {
+            background: #383838;
+            border-color: #555;
+        }
+        .cal-day-cell.other-month {
+            color: #555;
+            background: #202020;
+            cursor: default;
+        }
+        .cal-day-cell.has-recordings {
+            background: #1b382b;
+            border-color: #2e7d32;
+            color: #e8f5e9;
+            font-weight: bold;
+        }
+        .cal-day-cell.has-recordings::after {
+            content: '';
+            width: 5px;
+            height: 5px;
+            background: #4CAF50;
+            border-radius: 50%;
+            margin-top: 2px;
+        }
+        .cal-day-cell.selected {
+            background: #1565C0 !important;
+            border-color: #64B5F6 !important;
+            color: #fff !important;
+            box-shadow: 0 0 6px rgba(33, 150, 243, 0.5);
+        }
+
+        /* Tabela nagrań */
+        .rec-table-row:hover {
+            background: #2f2f2f;
+        }
+        .btn-action {
+            padding: 4px 8px;
+            font-size: 12px;
+            font-weight: bold;
+            border-radius: 3px;
+        }
+        .btn-play {
+            background: #1976D2;
+            color: white;
+        }
+        .btn-play:hover { background: #2196F3; }
+        .btn-dl {
+            background: #388E3C;
+            color: white;
+        }
+        .btn-dl:hover { background: #4CAF50; }
     </style>
 </head>
 <body>
 
+<!-- Niezależny lewy panel boczny z kontrolerami (NVR) -->
 <aside class="sidebar">
     <div class="panel">
         <h3>Kontrolery (Rejestratory)</h3>
@@ -207,7 +345,7 @@
     </div>
 
     <div class="panel">
-        <h3>Układ siatki</h3>
+        <h3>Układ siatki Live</h3>
         <div class="grid-buttons">
             <button id="grid-btn-1" onclick="setGrid(1)">1x1</button>
             <button id="grid-btn-4" class="active" onclick="setGrid(4)">2x2</button>
@@ -228,8 +366,130 @@
     </div>
 </aside>
 
+<!-- Główna zawartość z zakładkami -->
 <main class="main-area">
-    <div id="grid" class="video-grid grid-4"></div>
+    <!-- Pasek zakładek w stylu przeglądarkowym -->
+    <nav class="tabs-nav">
+        <button id="tab-btn-live" class="tab-btn active" onclick="switchMainTab('live')">
+            <span>📹 Widok z kamer</span>
+        </button>
+        <button id="tab-btn-recordings" class="tab-btn" onclick="switchMainTab('recordings')">
+            <span>💾 Nagrania</span>
+        </button>
+    </nav>
+
+    <!-- Kontener zawartości zakładek -->
+    <div class="views-container">
+        <!-- Zakładka 1: Widok z kamer (Live Grid) -->
+        <div id="view-live" class="video-grid grid-4"></div>
+
+        <!-- Zakładka 2: Nagrania zgromadzone na kontrolerach -->
+        <div id="view-recordings">
+            <!-- Pasek wyboru kamery -->
+            <div class="panel" style="padding: 10px 14px; display: flex; align-items: center; gap: 14px; flex-shrink: 0;">
+                <label for="rec-camera-select" style="font-weight: bold; font-size: 14px; color: #ddd;">Kamera do nagrań:</label>
+                <select id="rec-camera-select" style="padding: 6px 12px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; min-width: 320px; font-size: 13px;" onchange="onRecCameraChange()">
+                    <!-- Zasilane dynamicznie z zaznaczonych kontrolerów -->
+                </select>
+                <span id="rec-camera-info" style="font-size: 13px; color: #aaa;"></span>
+            </div>
+
+            <!-- Główny układ nagrań: 2 kolumny -->
+            <div style="flex-grow: 1; display: flex; gap: 15px; min-height: 0; overflow: hidden;">
+                
+                <!-- Lewa kolumna: Kalendarz + Przedział czasowy pobierania -->
+                <div style="width: 330px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; overflow-y: auto;">
+                    
+                    <!-- Interaktywny kalendarz -->
+                    <div class="panel" style="padding: 12px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <button onclick="changeCalMonth(-1)" style="padding: 4px 10px; font-weight: bold; border-radius: 4px;">‹ Poprzedni</button>
+                            <span id="cal-month-year" style="font-weight: bold; font-size: 14px; color: #fff;"></span>
+                            <button onclick="changeCalMonth(1)" style="padding: 4px 10px; font-weight: bold; border-radius: 4px;">Następny ›</button>
+                        </div>
+                        
+                        <!-- Dni tygodnia -->
+                        <div style="display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; font-size: 11px; font-weight: bold; color: #888; margin-bottom: 6px;">
+                            <div>Pn</div><div>Wt</div><div>Śr</div><div>Cz</div><div>Pt</div><div>So</div><div>Nd</div>
+                        </div>
+                        
+                        <!-- Siatka dni -->
+                        <div id="cal-days-grid" style="display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px;"></div>
+
+                        <div style="margin-top: 10px; font-size: 11px; color: #aaa; display: flex; align-items: center; gap: 8px;">
+                            <span style="display: inline-block; width: 8px; height: 8px; background: #4CAF50; border-radius: 50%;"></span>
+                            <span>Dni z dostępnymi nagraniami na kontrolerze</span>
+                        </div>
+                    </div>
+
+                    <!-- Pobieranie wybranego przedziału czasowego -->
+                    <div class="panel" style="padding: 12px;">
+                        <h3 style="margin-top: 0; font-size: 14px;">Pobierz przedział czasowy (.avi)</h3>
+                        <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px;">
+                            <div>
+                                <label style="color: #bbb; display: block; margin-bottom: 3px;">Od godziny:</label>
+                                <input type="time" id="range-start-time" value="00:00:00" step="1" style="width: 100%; padding: 6px; background: #333; color: white; border: 1px solid #555; border-radius: 4px;">
+                            </div>
+                            <div>
+                                <label style="color: #bbb; display: block; margin-bottom: 3px;">Do godziny:</label>
+                                <input type="time" id="range-end-time" value="23:59:59" step="1" style="width: 100%; padding: 6px; background: #333; color: white; border: 1px solid #555; border-radius: 4px;">
+                            </div>
+                            <button class="btn-success" onclick="downloadCustomRangeAVI()" style="margin-top: 4px; padding: 9px 12px; font-size: 13px;">
+                                ⬇ Pobierz wskazany przedział (.avi)
+                            </button>
+                        </div>
+                    </div>
+
+                </div>
+
+                <!-- Prawa kolumna: Podgląd wideo + Tabela plików -->
+                <div style="flex-grow: 1; display: flex; flex-direction: column; gap: 12px; min-width: 0; overflow: hidden;">
+                    
+                    <!-- Podgląd wideo nagrania -->
+                    <div class="panel" style="padding: 10px; display: flex; flex-direction: column; flex-shrink: 0;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <span id="player-title" style="font-size: 13px; font-weight: bold; color: #2196F3;">Podgląd nagrania: Wybierz plik z tabeli poniżej</span>
+                            <button id="player-download-btn" style="padding: 4px 10px; font-size: 12px; background: #388E3C; display: none;" onclick="downloadCurrentPreviewAVI()">
+                                ⬇ Pobierz ten plik (.avi)
+                            </button>
+                        </div>
+                        <div style="width: 100%; height: 260px; background: #000; border-radius: 4px; overflow: hidden; position: relative;">
+                            <video id="rec-preview-video" controls playsinline style="width: 100%; height: 100%; object-fit: contain;"></video>
+                        </div>
+                    </div>
+
+                    <!-- Tabela nagrań dla wybranego dnia -->
+                    <div class="panel" style="flex-grow: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-shrink: 0;">
+                            <h3 style="margin: 0; font-size: 14px; border: none; padding: 0;" id="rec-table-title">Dostępne nagrania dla wybranego dnia</h3>
+                            <span id="rec-table-count" style="font-size: 12px; color: #aaa;"></span>
+                        </div>
+                        <div style="flex-grow: 1; overflow-y: auto; min-height: 0;">
+                            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: left;">
+                                <thead style="position: sticky; top: 0; background: #2f2f2f; z-index: 1;">
+                                    <tr style="border-bottom: 1px solid #444; color: #bbb;">
+                                        <th style="padding: 8px; width: 45px;">Lp.</th>
+                                        <th style="padding: 8px;">Początek</th>
+                                        <th style="padding: 8px;">Koniec</th>
+                                        <th style="padding: 8px; width: 110px;">Czas trwania</th>
+                                        <th style="padding: 8px; width: 95px;">Rozmiar</th>
+                                        <th style="padding: 8px; width: 200px; text-align: center;">Akcje</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="rec-table-body">
+                                    <tr>
+                                        <td colspan="6" style="padding: 25px; text-align: center; color: #888;">Wybierz kamerę i dzień w kalendarzu, aby wyświetlić listę nagrań.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                </div>
+
+            </div>
+        </div>
+    </div>
 </main>
 
 <script>
@@ -240,10 +500,50 @@
     const cellStreamQuality = {};        // cellIndex -> 2 (SD) lub 1 (HQ)
     const cellActiveSelection = {};      // cellIndex -> { key: "dvrId:channel", label: "..." }
 
+    // Stan modułu Nagrania
+    let calCurrentYear = 2026;
+    let calCurrentMonth = 10;           // 1-12
+    let calSelectedDay = 27;            // Domyślnie dzisiejszy dzień
+    let calHighlightedDays = new Set(); // Dni z nagraniami pobrane z NVR
+    let currentRecordingsList = [];     // Lista plików nagrań dla wybranego dnia
+    let currentSelectedFile = null;     // Aktualnie podglądany plik
+
+    const monthNamesPl = [
+        "Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec",
+        "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"
+    ];
+
     window.onload = async () => {
+        // Domyślna data z zegara
+        const today = new Date();
+        calCurrentYear = today.getFullYear();
+        calCurrentMonth = today.getMonth() + 1;
+        calSelectedDay = today.getDate();
+
         setGrid(4);
         await refreshDvrList(true);
     };
+
+    // Przełączanie głównych zakładek bez resetowania strumieni WebRTC
+    function switchMainTab(tabName) {
+        const liveBtn = document.getElementById('tab-btn-live');
+        const recBtn = document.getElementById('tab-btn-recordings');
+        const liveView = document.getElementById('view-live');
+        const recView = document.getElementById('view-recordings');
+
+        if (tabName === 'live') {
+            liveBtn.classList.add('active');
+            recBtn.classList.remove('active');
+            liveView.style.display = 'grid';
+            recView.style.display = 'none';
+        } else {
+            recBtn.classList.add('active');
+            liveBtn.classList.remove('active');
+            liveView.style.display = 'none';
+            recView.style.display = 'flex';
+            updateRecCameraSelect();
+        }
+    }
 
     async function refreshDvrList(enableAllOnInit = false) {
         const response = await fetch('/api/dvrs');
@@ -255,6 +555,7 @@
 
         renderNvrSidebar();
         updateChannelSelectors();
+        updateRecCameraSelect();
     }
 
     function renderNvrSidebar() {
@@ -297,6 +598,7 @@
         renderNvrSidebar();
         // Aktualizujemy wyłącznie listy wyboru w kafelkach – NIE resetujemy aktywnych strumieni!
         updateChannelSelectors();
+        updateRecCameraSelect();
     }
 
     async function addDVR() {
@@ -335,6 +637,10 @@
             alert(`Błąd zapisu: ${err.detail}`);
         }
     }
+
+    /* ===============================================================
+       LOGIKA SIATKI I KAMER LIVE (ZAKŁADKA 1)
+       =============================================================== */
 
     function buildChannelOptionsForCell(cellIndex) {
         const currentSel = cellActiveSelection[cellIndex];
@@ -382,24 +688,21 @@
     }
 
     function setGrid(count) {
-        // Aktualizacja podświetlenia przycisku siatki
         [1, 4, 16].forEach(c => {
             const btn = document.getElementById(`grid-btn-${c}`);
             if (btn) btn.classList.toggle('active', c === count);
         });
 
-        const grid = document.getElementById('grid');
+        const grid = document.getElementById('view-live');
         grid.className = 'video-grid';
         if (count === 1) grid.classList.add('grid-1');
         if (count === 4) grid.classList.add('grid-4');
         if (count === 16) grid.classList.add('grid-16');
 
-        // Zamykamy połączenia kafelków, które znikają przy zmniejszeniu siatki
         for (let i = count; i < currentGridCount; i++) {
             closeCellConnection(i);
         }
 
-        // Dodajemy brakujące kafelki lub usuwamy nadmiarowe, zachowując już grające kafelki!
         for (let i = currentGridCount - 1; i >= count; i--) {
             const cell = document.getElementById(`cell-${i}`);
             if (cell) cell.remove();
@@ -424,7 +727,6 @@
             `;
             grid.appendChild(cellDiv);
 
-            // Jeśli dla tego kafelka była wcześniej wybrana kamera, wznawiamy ją
             if (cellActiveSelection[i] && cellActiveSelection[i].key) {
                 loadChannelToCell(i, cellActiveSelection[i].key);
             }
@@ -584,6 +886,289 @@
             clearTimeout(fallbackTimer);
             fallbackToMp4Stream(cellIndex, dvrId, channel, stream);
         }
+    }
+
+    /* ===============================================================
+       LOGIKA MODUŁU NAGRANIA (ZAKŁADKA 2)
+       =============================================================== */
+
+    function updateRecCameraSelect() {
+        const sel = document.getElementById('rec-camera-select');
+        if (!sel) return;
+
+        const currentVal = sel.value;
+        const activeDvrs = dvrDatabase.filter(d => enabledDvrIds.has(d.id));
+
+        let html = '<option value="">-- Wybierz kamerę do nagrań --</option>';
+        let hasSelected = false;
+
+        activeDvrs.forEach(dvr => {
+            if (!dvr.channels || !dvr.channels.length) return;
+            html += `<optgroup label="Rejestrator: ${dvr.name}">`;
+            dvr.channels.forEach(ch => {
+                const val = `${dvr.id}:${ch.channel_number}`;
+                const label = `[${dvr.name}] Kanał ${ch.channel_number}: ${ch.name}`;
+                const isSel = (val === currentVal);
+                if (isSel) hasSelected = true;
+                html += `<option value="${val}" ${isSel ? 'selected' : ''}>${label}</option>`;
+            });
+            html += `</optgroup>`;
+        });
+
+        sel.innerHTML = html;
+        if (!hasSelected && sel.options.length > 1) {
+            sel.selectedIndex = 1;
+        }
+
+        onRecCameraChange();
+    }
+
+    async function onRecCameraChange() {
+        const sel = document.getElementById('rec-camera-select');
+        const infoEl = document.getElementById('rec-camera-info');
+        if (!sel || !sel.value) {
+            calHighlightedDays.clear();
+            renderCalendar();
+            renderRecordingsTable([]);
+            if (infoEl) infoEl.textContent = 'Wybierz kamerę, aby załadować kalendarz nagrań.';
+            return;
+        }
+
+        const [dvrIdStr, chStr] = sel.value.split(':');
+        const dvrId = parseInt(dvrIdStr);
+        const channel = parseInt(chStr);
+
+        if (infoEl) infoEl.textContent = 'Sprawdzanie nagrań na dysku...';
+        await loadCalendarDays(dvrId, channel, calCurrentYear, calCurrentMonth);
+        if (infoEl) infoEl.textContent = `Dostępne dni z nagraniami: ${calHighlightedDays.size}`;
+        
+        await loadRecordingsForSelectedDate();
+    }
+
+    async function loadCalendarDays(dvrId, channel, year, month) {
+        calHighlightedDays.clear();
+        try {
+            const res = await fetch(`/api/recordings/days?dvr_id=${dvrId}&channel=${channel}&year=${year}&month=${month}`);
+            if (res.ok) {
+                const data = await res.json();
+                (data.days || []).forEach(d => calHighlightedDays.add(d));
+            }
+        } catch (e) {
+            console.error('Błąd pobierania dni nagrań:', e);
+        }
+        renderCalendar();
+    }
+
+    function changeCalMonth(delta) {
+        calCurrentMonth += delta;
+        if (calCurrentMonth < 1) {
+            calCurrentMonth = 12;
+            calCurrentYear -= 1;
+        } else if (calCurrentMonth > 12) {
+            calCurrentMonth = 1;
+            calCurrentYear += 1;
+        }
+
+        const sel = document.getElementById('rec-camera-select');
+        if (sel && sel.value) {
+            const [dvrIdStr, chStr] = sel.value.split(':');
+            loadCalendarDays(parseInt(dvrIdStr), parseInt(chStr), calCurrentYear, calCurrentMonth);
+        } else {
+            renderCalendar();
+        }
+    }
+
+    function renderCalendar() {
+        const monthYearEl = document.getElementById('cal-month-year');
+        const gridEl = document.getElementById('cal-days-grid');
+        if (!monthYearEl || !gridEl) return;
+
+        monthYearEl.textContent = `${monthNamesPl[calCurrentMonth - 1]} ${calCurrentYear}`;
+        gridEl.innerHTML = '';
+
+        // Dni w miesiącu
+        const daysInMonth = new Date(calCurrentYear, calCurrentMonth, 0).getDate();
+        // Dzień tygodnia pierwszego dnia miesiąca (1 = Pn, 7 = Nd)
+        let firstDayIndex = new Date(calCurrentYear, calCurrentMonth - 1, 1).getDay();
+        firstDayIndex = (firstDayIndex === 0) ? 6 : firstDayIndex - 1; // Konwersja na Pn=0 .. Nd=6
+
+        // Poprzedni miesiąc - dni dopełniające
+        const prevMonthDays = new Date(calCurrentYear, calCurrentMonth - 1, 0).getDate();
+        for (let i = firstDayIndex - 1; i >= 0; i--) {
+            const d = prevMonthDays - i;
+            const cell = document.createElement('div');
+            cell.className = 'cal-day-cell other-month';
+            cell.textContent = d;
+            gridEl.appendChild(cell);
+        }
+
+        // Aktualny miesiąc
+        for (let day = 1; day <= daysInMonth; day++) {
+            const cell = document.createElement('div');
+            const hasRec = calHighlightedDays.has(day);
+            const isSel = (day === calSelectedDay);
+
+            cell.className = `cal-day-cell ${hasRec ? 'has-recordings' : ''} ${isSel ? 'selected' : ''}`;
+            cell.textContent = day;
+            cell.onclick = () => selectCalendarDay(day);
+
+            gridEl.appendChild(cell);
+        }
+
+        // Następny miesiąc - dni dopełniające do pełnych rzędów
+        const totalCells = firstDayIndex + daysInMonth;
+        const remainder = totalCells % 7;
+        if (remainder !== 0) {
+            const nextDays = 7 - remainder;
+            for (let day = 1; day <= nextDays; day++) {
+                const cell = document.createElement('div');
+                cell.className = 'cal-day-cell other-month';
+                cell.textContent = day;
+                gridEl.appendChild(cell);
+            }
+        }
+    }
+
+    async function selectCalendarDay(day) {
+        calSelectedDay = day;
+        renderCalendar();
+        await loadRecordingsForSelectedDate();
+    }
+
+    function getFormattedSelectedDate() {
+        const m = calCurrentMonth < 10 ? `0${calCurrentMonth}` : `${calCurrentMonth}`;
+        const d = calSelectedDay < 10 ? `0${calSelectedDay}` : `${calSelectedDay}`;
+        return `${calCurrentYear}-${m}-${d}`;
+    }
+
+    async function loadRecordingsForSelectedDate() {
+        const sel = document.getElementById('rec-camera-select');
+        const tableTitle = document.getElementById('rec-table-title');
+        const tableCount = document.getElementById('rec-table-count');
+        const bodyEl = document.getElementById('rec-table-body');
+
+        if (!sel || !sel.value) return;
+        const [dvrIdStr, chStr] = sel.value.split(':');
+        const dvrId = parseInt(dvrIdStr);
+        const channel = parseInt(chStr);
+        const dateStr = getFormattedSelectedDate();
+
+        if (tableTitle) tableTitle.textContent = `Nagrania dla dnia: ${dateStr}`;
+        if (tableCount) tableCount.textContent = 'Wyszukiwanie plików...';
+        if (bodyEl) bodyEl.innerHTML = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #aaa;">Pobieranie indeksu nagrań z dysku rejestratora...</td></tr>';
+
+        try {
+            const res = await fetch(`/api/recordings/files?dvr_id=${dvrId}&channel=${channel}&date=${dateStr}`);
+            if (!res.ok) {
+                if (tableCount) tableCount.textContent = 'Błąd pobierania';
+                if (bodyEl) bodyEl.innerHTML = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #e57373;">Nie udało się pobrać listy nagrań z rejestratora.</td></tr>';
+                return;
+            }
+
+            const data = await res.json();
+            currentRecordingsList = data.files || [];
+            if (tableCount) tableCount.textContent = `Znaleziono plików: ${currentRecordingsList.length}`;
+            renderRecordingsTable(currentRecordingsList);
+        } catch (e) {
+            console.error('Błąd pobierania nagrań:', e);
+            if (tableCount) tableCount.textContent = 'Błąd sieci';
+            if (bodyEl) bodyEl.innerHTML = '<tr><td colspan="6" style="padding: 20px; text-align: center; color: #e57373;">Błąd połączenia z serwerem.</td></tr>';
+        }
+    }
+
+    function renderRecordingsTable(files) {
+        const bodyEl = document.getElementById('rec-table-body');
+        if (!bodyEl) return;
+
+        if (!files || !files.length) {
+            bodyEl.innerHTML = '<tr><td colspan="6" style="padding: 25px; text-align: center; color: #888;">Brak nagrań w wybranym dniu dla tej kamery.</td></tr>';
+            return;
+        }
+
+        bodyEl.innerHTML = '';
+        files.forEach((f, idx) => {
+            const tr = document.createElement('tr');
+            tr.className = 'rec-table-row';
+            tr.style.borderBottom = '1px solid #333';
+
+            tr.innerHTML = `
+                <td style="padding: 8px; color: #888;">${f.index || (idx + 1)}</td>
+                <td style="padding: 8px; font-weight: 500; color: #fff;">${f.start_time}</td>
+                <td style="padding: 8px; color: #ccc;">${f.end_time}</td>
+                <td style="padding: 8px; color: #90CAF9; font-weight: 500;">${f.duration_formatted}</td>
+                <td style="padding: 8px; color: #aaa;">${f.size_mb} MB</td>
+                <td style="padding: 8px; text-align: center;">
+                    <div style="display: flex; gap: 6px; justify-content: center;">
+                        <button class="btn-action btn-play" onclick='playRecordingPreview(${JSON.stringify(f)})'>▶ Odtwórz</button>
+                        <button class="btn-action btn-dl" onclick='downloadRecordingFileAVI(${JSON.stringify(f)})'>⬇ Pobierz AVI</button>
+                    </div>
+                </td>
+            `;
+            bodyEl.appendChild(tr);
+        });
+    }
+
+    function playRecordingPreview(fileItem) {
+        currentSelectedFile = fileItem;
+        const video = document.getElementById('rec-preview-video');
+        const titleEl = document.getElementById('player-title');
+        const dlBtn = document.getElementById('player-download-btn');
+        const sel = document.getElementById('rec-camera-select');
+
+        if (!video || !sel || !sel.value) return;
+        const [dvrIdStr, chStr] = sel.value.split(':');
+        const dateStr = getFormattedSelectedDate();
+        const camLabel = sel.options[sel.selectedIndex]?.textContent || 'Kamera';
+
+        if (titleEl) {
+            titleEl.textContent = `Podgląd: ${camLabel} • ${fileItem.start_time} – ${fileItem.end_time} (${fileItem.duration_formatted})`;
+        }
+        if (dlBtn) dlBtn.style.display = 'inline-block';
+
+        const url = `/api/recordings/preview?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&filename=${encodeURIComponent(fileItem.filename)}&start_time=${encodeURIComponent(fileItem.time_only_start)}&end_time=${encodeURIComponent(fileItem.time_only_end)}`;
+        video.src = url;
+        video.play().catch(() => {});
+    }
+
+    function downloadCurrentPreviewAVI() {
+        if (!currentSelectedFile) return alert('Najpierw wybierz nagranie z tabeli!');
+        downloadRecordingFileAVI(currentSelectedFile);
+    }
+
+    function downloadRecordingFileAVI(fileItem) {
+        const sel = document.getElementById('rec-camera-select');
+        if (!sel || !sel.value) return alert('Wybierz kamerę!');
+        const [dvrIdStr, chStr] = sel.value.split(':');
+        const dateStr = getFormattedSelectedDate();
+
+        const url = `/api/recordings/download?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&filename=${encodeURIComponent(fileItem.filename)}&start_time=${encodeURIComponent(fileItem.time_only_start)}&end_time=${encodeURIComponent(fileItem.time_only_end)}`;
+        
+        // Wywołujemy natywny download w przeglądarce
+        const a = document.createElement('a');
+        a.href = url;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+    }
+
+    function downloadCustomRangeAVI() {
+        const sel = document.getElementById('rec-camera-select');
+        if (!sel || !sel.value) return alert('Wybierz kamerę do pobrania!');
+        const [dvrIdStr, chStr] = sel.value.split(':');
+        const dateStr = getFormattedSelectedDate();
+
+        const sTime = document.getElementById('range-start-time').value.trim() || '00:00:00';
+        const eTime = document.getElementById('range-end-time').value.trim() || '23:59:59';
+
+        const url = `/api/recordings/download?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&start_time=${encodeURIComponent(sTime)}&end_time=${encodeURIComponent(eTime)}`;
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
     }
 </script>
 </body>

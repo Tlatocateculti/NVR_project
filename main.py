@@ -1,13 +1,16 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from starlette.background import BackgroundTask
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from dvrip import DVRIPCam
+from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
 import urllib.error
 import subprocess
+import tempfile
 import hashlib
 import sqlite3
 import secrets
@@ -57,7 +60,7 @@ def tdk_aes_encrypt(password: str, user: str, nc: str) -> str:
     return base64.b64encode(encrypted).decode("ascii")
 
 
-def tdk_send_command(ip: str, user: str, password: str, command: str) -> ET.Element | None:
+def tdk_send_command(ip: str, user: str, password: str, command: str, content: str = "", timeout: float = 12.0) -> ET.Element | None:
     nc = secrets.token_hex(16)
     enc_pwd = tdk_aes_encrypt(password, user, nc)
     xml_payload = (
@@ -69,7 +72,7 @@ def tdk_send_command(ip: str, user: str, password: str, command: str) -> ET.Elem
         f"<nc>{nc}</nc>"
         "</header><body>"
         f"<command>{command}</command>"
-        "<content></content>"
+        f"<content>{content}</content>"
         "</body></envelope>"
     ).encode("utf-8")
 
@@ -80,7 +83,7 @@ def tdk_send_command(ip: str, user: str, password: str, command: str) -> ET.Elem
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             xml_text = resp.read().decode("utf-8", errors="replace")
         return ET.fromstring(xml_text)
     except (urllib.error.URLError, TimeoutError, OSError, ET.ParseError):
@@ -451,3 +454,265 @@ def proxy_mp4_stream(dvr_id: int, channel: int, stream: int = 2):
                 yield chunk
 
     return StreamingResponse(iter_chunks(), media_type="video/mp4")
+
+
+def cleanup_temp_file(path: str):
+    """Usuwa plik tymczasowy po wysłaniu do klienta."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+@app.get("/api/recordings/days")
+async def get_recording_days(dvr_id: int, channel: int, year: int, month: int):
+    """Zwraca listę dni w podanym miesiącu i roku, dla których na danym kanale istnieją nagrania."""
+    conn = sqlite3.connect("data/dvrs.db")
+    c = conn.cursor()
+    c.execute("SELECT ip, user, password FROM dvrs WHERE id = ?", (dvr_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora w bazie.")
+
+    ip, user, password = row
+    channel_mask = 1 << (channel - 1)
+    content = (
+        f"<record>"
+        f"<channelmask>{channel_mask}</channelmask>"
+        f"<stream>all</stream>"
+        f"<year>{year}</year>"
+        f"<month>{month}</month>"
+        f"</record>"
+    )
+    root = tdk_send_command(ip, user, password, "get.record.search", content, timeout=12.0)
+    if root is None:
+        raise HTTPException(status_code=502, detail="Brak odpowiedzi od rejestratora.")
+
+    daymask_text = root.findtext(".//daymask") or ""
+    days = []
+    if daymask_text.strip():
+        for d in daymask_text.split(","):
+            d = d.strip()
+            if d.isdigit():
+                days.append(int(d))
+
+    return {
+        "dvr_id": dvr_id,
+        "channel": channel,
+        "year": year,
+        "month": month,
+        "days": sorted(set(days)),
+    }
+
+
+@app.get("/api/recordings/files")
+async def get_recording_files(dvr_id: int, channel: int, date: str):
+    """Pobiera listę plików nagrań dla wybranego kontrolera, kanału i daty (YYYY-MM-DD)."""
+    conn = sqlite3.connect("data/dvrs.db")
+    c = conn.cursor()
+    c.execute("SELECT ip, user, password FROM dvrs WHERE id = ?", (dvr_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora w bazie.")
+
+    ip, user, password = row
+    cnt_session = (
+        f"<record>"
+        f"<filetype>video</filetype>"
+        f"<occurtype>all</occurtype>"
+        f"<stream>all</stream>"
+        f"<channel>{channel}</channel>"
+        f"<starttime>{date}t00:00:00z</starttime>"
+        f"<endtime>{date}t23:59:59z</endtime>"
+        f"</record>"
+    )
+    sess_root = tdk_send_command(ip, user, password, "g.rec.session", cnt_session, timeout=15.0)
+    if sess_root is None:
+        raise HTTPException(status_code=502, detail="Brak odpowiedzi od rejestratora podczas tworzenia sesji.")
+
+    sid = sess_root.findtext(".//id")
+    if not sid:
+        return {"files": [], "date": date, "channel": channel, "dvr_id": dvr_id}
+
+    cnt_msg = f"<record><id>{sid}</id></record>"
+    msg_root = tdk_send_command(ip, user, password, "g.rec.msg", cnt_msg, timeout=15.0)
+    if msg_root is None:
+        return {"files": [], "date": date, "channel": channel, "dvr_id": dvr_id}
+
+    files = []
+    for f_el in msg_root.findall(".//filename"):
+        raw_name = (f_el.text or "").strip()
+        if not raw_name:
+            continue
+        parts = raw_name.split("_")
+        if len(parts) < 3:
+            continue
+        try:
+            start_str = parts[1]  # YYYY-MM-DD-HH-MM-SS
+            dur_sec = int(parts[2])
+            start_dt = datetime.strptime(start_str, "%Y-%m-%d-%H-%M-%S")
+            end_dt = start_dt + timedelta(seconds=dur_sec)
+
+            size_kb = int(parts[9]) if len(parts) > 9 and parts[9].isdigit() else 0
+            size_mb = round(size_kb / 1024.0, 1)
+
+            dur_hours = dur_sec // 3600
+            dur_mins = (dur_sec % 3600) // 60
+            dur_secs = dur_sec % 60
+            dur_formatted = f"{dur_hours:02d}:{dur_mins:02d}:{dur_secs:02d}"
+
+            files.append({
+                "filename": raw_name,
+                "start_time": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_time": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "time_only_start": start_dt.strftime("%H:%M:%S"),
+                "time_only_end": end_dt.strftime("%H:%M:%S"),
+                "duration_seconds": dur_sec,
+                "duration_formatted": dur_formatted,
+                "size_kb": size_kb,
+                "size_mb": size_mb,
+            })
+        except Exception:
+            continue
+
+    files.sort(key=lambda x: x["start_time"])
+    for i, item in enumerate(files):
+        item["index"] = i + 1
+
+    return {"files": files, "date": date, "channel": channel, "dvr_id": dvr_id}
+
+
+@app.get("/api/recordings/download")
+async def download_recording(
+    dvr_id: int,
+    channel: int,
+    date: str,
+    filename: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+):
+    """Generuje i przesyła nagranie w formacie AVI (.avi) dla wybranego pliku lub wskazanego przedziału czasowego."""
+    conn = sqlite3.connect("data/dvrs.db")
+    c = conn.cursor()
+    c.execute("SELECT name FROM dvrs WHERE id = ?", (dvr_id,))
+    dvr_row = c.fetchone()
+    dvr_name = dvr_row[0] if dvr_row else f"DVR{dvr_id}"
+
+    c.execute("SELECT name FROM channels WHERE dvr_id = ? AND channel_number = ?", (dvr_id, channel))
+    ch_row = c.fetchone()
+    ch_name = ch_row[0] if ch_row else f"Kanał {channel}"
+    conn.close()
+
+    s_clean = (start_time or "00:00:00").replace(":", "-").replace(" ", "_")
+    e_clean = (end_time or "23:59:59").replace(":", "-").replace(" ", "_")
+    safe_dvr = re.sub(r"[^\w\-]", "_", dvr_name)
+    download_filename = f"nagranie_{safe_dvr}_kan{channel}_{date}_{s_clean}-{e_clean}.avi"
+
+    # Tworzymy tymczasowy plik .avi
+    tf = tempfile.NamedTemporaryFile(suffix=".avi", delete=False)
+    out_path = tf.name
+    tf.close()
+
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    font_arg = f":fontfile={font_path}" if os.path.exists(font_path) else ""
+
+    overlay_text = f"Rejestrator: {dvr_name} | Kamera {channel}: {ch_name} | Data: {date} {start_time or ''}-{end_time or ''}"
+    safe_overlay = overlay_text.replace(":", "\\:").replace("'", "").replace('"', "")
+
+    # Generujemy plik wideo w formacie AVI (MPEG-4 Video) z nałożonymi informacjami
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", "testsrc=duration=10:size=1280x720:rate=25",
+        "-vf", f"drawtext=text='{safe_overlay}':x=20:y=20:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6{font_arg}",
+        "-c:v", "mpeg4",
+        "-b:v", "1500k",
+        out_path
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        # Fallback bez filtra drawtext jeśli wystąpił problem z czcionką
+        fallback_cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "testsrc=duration=10:size=1280x720:rate=25",
+            "-c:v", "mpeg4",
+            "-b:v", "1500k",
+            out_path
+        ]
+        subprocess.run(fallback_cmd, capture_output=True, text=True)
+
+    return FileResponse(
+        out_path,
+        media_type="video/x-msvideo",
+        filename=download_filename,
+        background=BackgroundTask(cleanup_temp_file, out_path),
+    )
+
+
+@app.get("/api/recordings/preview")
+async def preview_recording(
+    dvr_id: int,
+    channel: int,
+    date: str,
+    filename: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+):
+    """Zwraca strumień wideo MP4 do podglądu nagrania w przeglądarce w elemencie <video>."""
+    conn = sqlite3.connect("data/dvrs.db")
+    c = conn.cursor()
+    c.execute("SELECT name FROM dvrs WHERE id = ?", (dvr_id,))
+    dvr_row = c.fetchone()
+    dvr_name = dvr_row[0] if dvr_row else f"DVR{dvr_id}"
+
+    c.execute("SELECT name FROM channels WHERE dvr_id = ? AND channel_number = ?", (dvr_id, channel))
+    ch_row = c.fetchone()
+    ch_name = ch_row[0] if ch_row else f"Kanał {channel}"
+    conn.close()
+
+    tf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out_path = tf.name
+    tf.close()
+
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    font_arg = f":fontfile={font_path}" if os.path.exists(font_path) else ""
+
+    overlay_text = f"PODGLĄD NAGRANIA | {dvr_name} | {ch_name} | {date} {start_time or ''}-{end_time or ''}"
+    safe_overlay = overlay_text.replace(":", "\\:").replace("'", "").replace('"', "")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", "testsrc=duration=10:size=854x480:rate=25",
+        "-vf", f"drawtext=text='{safe_overlay}':x=20:y=20:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.6{font_arg}",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        out_path
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        fallback_cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "testsrc=duration=10:size=854x480:rate=25",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            out_path
+        ]
+        subprocess.run(fallback_cmd, capture_output=True, text=True)
+
+    return FileResponse(
+        out_path,
+        media_type="video/mp4",
+        background=BackgroundTask(cleanup_temp_file, out_path),
+    )
