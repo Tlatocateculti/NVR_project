@@ -1125,7 +1125,8 @@
         }
         if (dlBtn) dlBtn.style.display = 'inline-block';
 
-        const url = `/api/recordings/preview?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&filename=${encodeURIComponent(fileItem.filename)}&start_time=${encodeURIComponent(fileItem.time_only_start)}&end_time=${encodeURIComponent(fileItem.time_only_end)}`;
+        // Nowa próba podglądu nie może użyć starego pliku z pamięci przeglądarki.
+        const url = `/api/recordings/preview?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&filename=${encodeURIComponent(fileItem.filename)}&start_time=${encodeURIComponent(fileItem.time_only_start)}&end_time=${encodeURIComponent(fileItem.time_only_end)}&_=${Date.now()}`;
         video.src = url;
         video.play().catch(() => {});
     }
