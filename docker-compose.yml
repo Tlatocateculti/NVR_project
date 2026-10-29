@@ -1,7 +1,7 @@
-version: '3.8'
 services:
   web:
     build: .
+    restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
@@ -11,9 +11,9 @@ services:
       - go2rtc
   go2rtc:
     image: alexxit/go2rtc:latest
+    restart: unless-stopped
     ports:
       - "1984:1984"
       - "8554:8554"
       - "8555:8555/tcp"
       - "8555:8555/udp"
-    restart: unless-stopped

@@ -1,0 +1,22 @@
+# Local Python artifacts
+__pycache__/
+*.py[cod]
+
+# Local NVR state: contains credentials and recordings generated during use
+data/dvrs.db
+data/dvrs.db-*
+data/archive-tmp/
+data/go2rtc-managed.yaml
+data/go2rtc-runtime.log
+data/research-private/
+
+# Windows-only relay binary
+tools/*.exe
+
+# Investigation and hand-off material; not required by the application
+docs/private/
+docs/research/
+
+# Local Codex workspace metadata
+.agents/
+.codex/

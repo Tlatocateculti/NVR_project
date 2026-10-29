@@ -1,0 +1,7 @@
+# Keep repository diffs portable between Windows and Unix-like hosts.
+* text=auto eol=lf
+
+# Binary and locally generated files must never be text-normalized.
+*.db binary
+*.exe binary
+*.pcapng binary

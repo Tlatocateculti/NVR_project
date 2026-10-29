@@ -1,7 +1,19 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from starlette.background import BackgroundTask
+from pathlib import Path
+from contextlib import asynccontextmanager
+from typing import Literal
+from threading import BoundedSemaphore, Lock
+import shutil
+import tempfile
+import logging
+import mimetypes
+from quii_archive import ArchiveError, Recording, save_video, convert_video
+from local_runtime import LocalRelay
+from live_proxy import open_mp4_proxy
 from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dvrip import DVRIPCam
 from datetime import datetime, timedelta
@@ -10,7 +22,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import subprocess
-import tempfile
 import hashlib
 import sqlite3
 import secrets
@@ -20,10 +31,29 @@ import json
 import re
 import os
 
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+@asynccontextmanager
+async def app_lifespan(app):
+    local_relay.start()
+    try:
+        yield
+    finally:
+        local_relay.stop()
 
-GO2RTC_API = "http://go2rtc:1984"
+
+app = FastAPI(lifespan=app_lifespan)
+templates = Jinja2Templates(directory="templates")
+mimetypes.add_type("text/javascript", ".mjs")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+GO2RTC_API = os.environ.get(
+    "GO2RTC_API", "http://127.0.0.1:1984" if os.name == "nt" else "http://go2rtc:1984"
+).rstrip("/")
+local_relay = LocalRelay(GO2RTC_API, Path(__file__).resolve().parent)
+GO2RTC_RTSP = os.environ.get(
+    "GO2RTC_RTSP", f"rtsp://{urllib.parse.urlparse(GO2RTC_API).hostname}:8554"
+).rstrip("/")
+LIVE_STREAM_LOCK = Lock()
+LIVE_STREAM_SIGNATURES = {}
 
 os.makedirs("data", exist_ok=True)
 
@@ -296,6 +326,10 @@ def fetch_nvr_channels(nvr: NVR) -> list[dict]:
 
 
 def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
+    try:
+        local_relay.ensure()
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Przekaźnik obrazu jest uruchamiany. Spróbuj ponownie za chwilę.") from exc
     conn = sqlite3.connect("data/dvrs.db")
     c = conn.cursor()
     c.execute("SELECT ip, port, user, password FROM dvrs WHERE id = ?", (dvr_id,))
@@ -317,12 +351,20 @@ def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
     # Dla strumienia głównego (HQ, ids=1), który często jest kodowany w H.265 (HEVC),
     # dodajemy drugie źródło ffmpeg->H.264, aby WebRTC działało w przeglądarkach bez wsparcia HEVC.
     if stream_id == 1:
-        rtsp_raw = f"rtsp://{u_enc}:{p_enc}@{ip}:554/mode=real&idc={channel}&ids=1"
-        params.append(("src", f"ffmpeg:{rtsp_raw}#video=h264"))
+        # Reuse go2rtc's local RTSP relay for transcoding. FFmpeg does not
+        # need another remote NVR connection or credentials in its command.
+        params.append(("src", f"ffmpeg:{stream_name}#video=h264#timeout=15"))
 
-    query = urllib.parse.urlencode(params)
-    put_req = urllib.request.Request(f"{GO2RTC_API}/api/streams?{query}", method="PUT")
-    urllib.request.urlopen(put_req, timeout=5.0).read()
+    signature = hashlib.sha256(repr(params).encode("utf-8")).digest()
+    with LIVE_STREAM_LOCK:
+        if LIVE_STREAM_SIGNATURES.get(stream_name) == signature:
+            with urllib.request.urlopen(f"{GO2RTC_API}/api/streams", timeout=5.0) as response:
+                if stream_name in json.load(response):
+                    return stream_name
+        query = urllib.parse.urlencode(params)
+        put_req = urllib.request.Request(f"{GO2RTC_API}/api/streams?{query}", method="PUT")
+        urllib.request.urlopen(put_req, timeout=5.0).read()
+        LIVE_STREAM_SIGNATURES[stream_name] = signature
     return stream_name
 
 
@@ -403,7 +445,7 @@ async def add_dvr(nvr: NVR):
 
 
 @app.post("/api/webrtc")
-async def start_webrtc_session(offer: WebRTCOffer, request: Request):
+def start_webrtc_session(offer: WebRTCOffer, request: Request):
     """Rejestruje strumień RTSP (#media=video) w go2rtc i zwraca SDP Answer z lokalnym kandydatem ICE."""
     try:
         stream_name = ensure_go2rtc_stream(offer.dvr_id, offer.channel, offer.stream)
@@ -414,7 +456,7 @@ async def start_webrtc_session(offer: WebRTCOffer, request: Request):
             headers={"Content-Type": "application/sdp"},
             method="POST",
         )
-        with urllib.request.urlopen(w_req, timeout=15.0) as w_resp:
+        with urllib.request.urlopen(w_req, timeout=30.0 if offer.stream == 1 else 15.0) as w_resp:
             answer_sdp = w_resp.read().decode("utf-8")
 
         ufrag_match = re.search(r"a=ice-ufrag:([^\r\n]+)", answer_sdp)
@@ -431,6 +473,8 @@ async def start_webrtc_session(offer: WebRTCOffer, request: Request):
         answer_sdp = answer_sdp.rstrip("\r\n") + "\r\n" + local_candidates
 
         return {"type": "answer", "sdp": answer_sdp}
+    except HTTPException:
+        raise
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
         raise HTTPException(status_code=502, detail=f"Błąd go2rtc ({e.code}): {err_body}")
@@ -440,37 +484,26 @@ async def start_webrtc_session(offer: WebRTCOffer, request: Request):
 
 @app.get("/api/stream.mp4")
 def proxy_mp4_stream(dvr_id: int, channel: int, stream: int = 2):
-    """Strumień fMP4 (MSE/HTTP) z go2rtc jako niezawodny fallback."""
+    """Copy H.264 from the relay into fMP4 without its HTTP MP4 consumer."""
     stream_name = ensure_go2rtc_stream(dvr_id, channel, stream)
-    url = f"{GO2RTC_API}/api/stream.mp4?src={urllib.parse.quote(stream_name)}"
-
-    def iter_chunks():
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=15.0) as resp:
-            while True:
-                chunk = resp.read(16384)
-                if not chunk:
-                    break
-                yield chunk
-
-    return StreamingResponse(iter_chunks(), media_type="video/mp4")
-
-
-def cleanup_temp_file(path: str):
-    """Usuwa plik tymczasowy po wysłaniu do klienta."""
+    binary = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
+    if not binary:
+        raise HTTPException(status_code=503, detail="Brak FFmpeg do podglądu obrazu.")
+    source = f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264"
     try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
+        proxy = open_mp4_proxy(binary, source)
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail="Nie udało się odebrać obrazu z przekaźnika.") from exc
+    return StreamingResponse(proxy.chunks(), media_type="video/mp4",
+                             background=BackgroundTask(proxy.close))
 
 
-def get_recording_dvr(dvr_id: int) -> tuple[str, str, str, str]:
+def get_recording_dvr(dvr_id: int) -> tuple[str, str, int, str, str]:
     """Zwraca dane połączenia do NVR, nie wystawiając hasła poza proces."""
     conn = sqlite3.connect("data/dvrs.db")
     try:
         row = conn.execute(
-            "SELECT name, ip, user, password FROM dvrs WHERE id = ?", (dvr_id,)
+            "SELECT name, ip, port, user, password FROM dvrs WHERE id = ?", (dvr_id,)
         ).fetchone()
     finally:
         conn.close()
@@ -480,78 +513,24 @@ def get_recording_dvr(dvr_id: int) -> tuple[str, str, str, str]:
 
 
 def validate_recording_request(date: str, filename: str | None, start_time: str | None, end_time: str | None) -> tuple[str, str]:
-    """Waliduje zakres, zanim zostanie przekazany do serwera RTSP NVR."""
     try:
         datetime.strptime(date, "%Y-%m-%d")
         start = datetime.strptime(start_time or "00:00:00", "%H:%M:%S")
         end = datetime.strptime(end_time or "23:59:59", "%H:%M:%S")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Nieprawidłowy format daty lub godziny nagrania.") from exc
-    if end <= start:
+    if filename:
+        try:
+            Recording.parse(filename)
+        except ArchiveError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    elif end <= start:
         raise HTTPException(status_code=422, detail="Koniec nagrania musi być późniejszy niż początek.")
-    if filename and ("/" in filename or "\\" in filename or ".." in filename):
-        raise HTTPException(status_code=422, detail="Nieprawidłowa nazwa pliku nagrania.")
     return start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S")
 
 
-def recording_rtsp_url(ip: str, user: str, password: str, channel: int, date: str, start_time: str, end_time: str) -> str:
-    """Adres archiwum RTSP Qualvision/TDK.
-
-    Ten model NVR używa tej samej ścieżki RTSP co podgląd na żywo, z trybem
-    ``playback`` i granicami czasu.  Dane logowania są kodowane, więc znaki
-    takie jak ``@`` albo ``#`` w haśle nie zmieniają składni URL-a.
-    """
-    q_user = urllib.parse.quote(user, safe="")
-    q_password = urllib.parse.quote(password, safe="")
-    start = f"{date}T{start_time}Z"
-    end = f"{date}T{end_time}Z"
-    params = urllib.parse.urlencode({
-        "idc": channel,
-        "ids": 1,
-        "starttime": start,
-        "endtime": end,
-    })
-    return f"rtsp://{q_user}:{q_password}@{ip}:554/mode=playback&{params}"
-
-
-def redact_url(text: str) -> str:
-    """Nie umieszczaj poświadczeń NVR w odpowiedzi błędu lub logu API."""
-    return re.sub(r"(rtsp://[^:/@]+:)[^@]+@", r"\1***@", text)
-
-
-def materialize_recording(
-    source_url: str,
-    output_path: str,
-    output_format: str,
-    max_seconds: int,
-) -> None:
-    """Pobiera materiał z archiwum NVR przez ffmpeg; nigdy nie tworzy atrapy."""
-    common = [
-        "ffmpeg", "-y", "-nostdin", "-rtsp_transport", "tcp",
-        "-i", source_url, "-map", "0:v:0?", "-map", "0:a?", "-t", str(max_seconds),
-    ]
-    if output_format == "avi":
-        cmd = common + ["-c", "copy", "-f", "avi", output_path]
-    else:
-        # NVR zwraca HEVC na części kanałów; H.264 + yuv420p działa w HTML5
-        # także w przeglądarkach bez sprzętowego dekodera HEVC.
-        cmd = common + [
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-movflags", "+faststart", "-f", "mp4", output_path,
-        ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max_seconds + 90)
-    except subprocess.TimeoutExpired as exc:
-        cleanup_temp_file(output_path)
-        raise HTTPException(status_code=504, detail="Przekroczono czas pobierania nagrania z rejestratora.") from exc
-    if proc.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        cleanup_temp_file(output_path)
-        diagnostic = redact_url((proc.stderr or "").strip().splitlines()[-1] if proc.stderr else "brak danych")
-        raise HTTPException(status_code=502, detail=f"NVR nie udostępnił wskazanego nagrania ({diagnostic}).")
-
-
 @app.get("/api/recordings/days")
-async def get_recording_days(dvr_id: int, channel: int, year: int, month: int):
+def get_recording_days(dvr_id: int, channel: int, year: int, month: int):
     """Zwraca listę dni w podanym miesiącu i roku, dla których na danym kanale istnieją nagrania."""
     conn = sqlite3.connect("data/dvrs.db")
     c = conn.cursor()
@@ -562,7 +541,8 @@ async def get_recording_days(dvr_id: int, channel: int, year: int, month: int):
         raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora w bazie.")
 
     ip, user, password = row
-    channel_mask = 1 << (channel - 1)
+    # Despite its name, this CGI field takes a channel number, not a bit mask.
+    channel_mask = channel
     content = (
         f"<record>"
         f"<channelmask>{channel_mask}</channelmask>"
@@ -593,7 +573,7 @@ async def get_recording_days(dvr_id: int, channel: int, year: int, month: int):
 
 
 @app.get("/api/recordings/files")
-async def get_recording_files(dvr_id: int, channel: int, date: str):
+def get_recording_files(dvr_id: int, channel: int, date: str):
     """Pobiera listę plików nagrań dla wybranego kontrolera, kanału i daty (YYYY-MM-DD)."""
     conn = sqlite3.connect("data/dvrs.db")
     c = conn.cursor()
@@ -670,63 +650,114 @@ async def get_recording_files(dvr_id: int, channel: int, date: str):
     return {"files": files, "date": date, "channel": channel, "dvr_id": dvr_id}
 
 
-@app.get("/api/recordings/download")
-async def download_recording(
-    dvr_id: int,
-    channel: int,
-    date: str,
-    filename: str | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
-):
-    """Pobiera rzeczywiste nagranie NVR jako AVI dla pliku lub przedziału czasu."""
+ARCHIVE_JOBS = BoundedSemaphore(2)
+
+
+def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, preview,
+                      output_format="avi", quality="original"):
+    if output_format not in ("avi", "mp4") or quality not in ("original", "1080p", "720p", "480p"):
+        raise HTTPException(status_code=422, detail="Nieprawidłowy format lub jakość nagrania.")
     if channel < 1:
         raise HTTPException(status_code=422, detail="Numer kanału musi być dodatni.")
-    dvr_name, ip, user, password = get_recording_dvr(dvr_id)
-    start, end = validate_recording_request(date, filename, start_time, end_time)
-    s_clean = start.replace(":", "-")
-    e_clean = end.replace(":", "-")
-    safe_dvr = re.sub(r"[^\w\-]", "_", dvr_name)
-    download_filename = f"nagranie_{safe_dvr}_kan{channel}_{date}_{s_clean}-{e_clean}.avi"
+    _, ip, port, user, password = get_recording_dvr(dvr_id)
+    start_time, end_time = validate_recording_request(date, filename, start_time, end_time)
+    if not ARCHIVE_JOBS.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Trwa przygotowywanie innych nagrań. Spróbuj ponownie za chwilę.")
+    folder = None
+    try:
+        # Only device-returned filenames may identify a recording. In particular,
+        # never substitute an invented RTSP URL or silently choose another file.
+        available = get_recording_files(dvr_id, channel, date)["files"]
+        if filename:
+            matches = [item for item in available if item["filename"] == filename]
+            if not matches:
+                raise HTTPException(status_code=404, detail="Wybrany plik nie jest już dostępny w archiwum.")
+            recording = Recording.parse(filename)
+            if recording.channel != channel:
+                raise HTTPException(status_code=422, detail="Plik nie należy do wybranej kamery.")
+            selections = [(recording, recording.start, recording.end)]
+        else:
+            begin = datetime.fromisoformat(f"{date}T{start_time}")
+            finish = datetime.fromisoformat(f"{date}T{end_time}")
+            selections = []
+            for item in available:
+                recording = Recording.parse(item["filename"])
+                if recording.channel != channel:
+                    continue
+                left, right = max(begin, recording.start), min(finish, recording.end)
+                if left < right:
+                    selections.append((recording, left, right))
+            selections.sort(key=lambda selection: selection[1])
+            # Search can return more than one stream for the same period. Pick
+            # the first available stream and never duplicate an overlap.
+            unique = []
+            covered_until = begin
+            for recording, left, right in selections:
+                left = max(left, covered_until)
+                if left < right:
+                    unique.append((recording, left, right))
+                    covered_until = right
+            selections = unique
+        if not selections:
+            raise HTTPException(status_code=404, detail="Brak nagrań w wybranym zakresie.")
+        if preview:
+            limit = max(1, min(300, int(os.environ.get("ARCHIVE_PREVIEW_SECONDS", "60"))))
+            recording, left, right = selections[0]
+            selections = [(recording, left, min(right, left + timedelta(seconds=limit)))]
+        scratch = Path("data/archive-tmp")
+        scratch.mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix="recording-", dir=scratch))
+        source = folder / "source.video"
+        codec, fps, count = save_video(ip, port, user, password, selections, source)
+        suffix = "mp4" if preview else output_format
+        result = folder / f"recording.{suffix}"
+        convert_video(source, result, codec, fps, preview=preview, quality=quality)
+        headers = {"Cache-Control": "no-store", "X-Archive-Audio": "none"}
+        if preview:
+            headers["X-Preview-Seconds"] = str(round(count / fps, 2))
+        return FileResponse(
+            result, media_type="video/mp4" if suffix == "mp4" else "video/x-msvideo",
+            filename=(f"nvr-{dvr_id}-ch-{channel}-"
+                      f"{selections[0][1]:%Y-%m-%d_%H-%M-%S}_{selections[-1][2]:%H-%M-%S}.{suffix}"),
+            content_disposition_type="inline" if preview else "attachment",
+            headers=headers,
+            background=BackgroundTask(shutil.rmtree, folder, ignore_errors=True),
+        )
+    except HTTPException:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+        raise
+    except (ArchiveError, OSError, ValueError) as exc:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+        if isinstance(exc, ArchiveError):
+            detail = str(exc)
+        elif isinstance(exc, TimeoutError):
+            detail = "Przekroczono czas oczekiwania na rejestrator. Spróbuj ponownie."
+        else:
+            detail = "Błąd połączenia lub przetwarzania archiwum."
+        logging.getLogger(__name__).warning("Archive operation failed: %s (errno=%s)",
+                                           type(exc).__name__, getattr(exc, "errno", None),
+                                           exc_info=not isinstance(exc, ArchiveError))
+        raise HTTPException(status_code=502, detail=detail) from exc
+    finally:
+        ARCHIVE_JOBS.release()
 
-    tf = tempfile.NamedTemporaryFile(suffix=".avi", delete=False)
-    out_path = tf.name
-    tf.close()
-    max_seconds = int((datetime.strptime(end, "%H:%M:%S") - datetime.strptime(start, "%H:%M:%S")).total_seconds())
-    materialize_recording(recording_rtsp_url(ip, user, password, channel, date, start, end), out_path, "avi", max_seconds)
 
-    return FileResponse(
-        out_path,
-        media_type="video/x-msvideo",
-        filename=download_filename,
-        background=BackgroundTask(cleanup_temp_file, out_path),
-    )
+@app.get("/api/recordings/download")
+def download_recording(
+    dvr_id: int, channel: int, date: str, filename: str | None = None,
+    start_time: str | None = None, end_time: str | None = None,
+    format: Literal["avi", "mp4"] = "avi",
+    quality: Literal["original", "1080p", "720p", "480p"] = "original",
+):
+    return prepare_recording(dvr_id, channel, date, filename, start_time, end_time, False,
+                             output_format=format, quality=quality)
 
 
 @app.get("/api/recordings/preview")
-async def preview_recording(
-    dvr_id: int,
-    channel: int,
-    date: str,
-    filename: str | None = None,
-    start_time: str | None = None,
-    end_time: str | None = None,
+def preview_recording(
+    dvr_id: int, channel: int, date: str, filename: str | None = None,
+    start_time: str | None = None, end_time: str | None = None,
 ):
-    """Zwraca rzeczywisty materiał archiwalny jako zgodny z HTML5 plik MP4."""
-    if channel < 1:
-        raise HTTPException(status_code=422, detail="Numer kanału musi być dodatni.")
-    _, ip, user, password = get_recording_dvr(dvr_id)
-    start, end = validate_recording_request(date, filename, start_time, end_time)
-
-    tf = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    out_path = tf.name
-    tf.close()
-
-    max_seconds = int((datetime.strptime(end, "%H:%M:%S") - datetime.strptime(start, "%H:%M:%S")).total_seconds())
-    materialize_recording(recording_rtsp_url(ip, user, password, channel, date, start, end), out_path, "mp4", max_seconds)
-
-    return FileResponse(
-        out_path,
-        media_type="video/mp4",
-        background=BackgroundTask(cleanup_temp_file, out_path),
-    )
+    return prepare_recording(dvr_id, channel, date, filename, start_time, end_time, True)

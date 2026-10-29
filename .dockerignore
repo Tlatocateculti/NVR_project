@@ -1,0 +1,15 @@
+.git
+.agents
+.codex
+tools/*.exe
+data/dvrs.db
+data/dvrs.db-*
+data/go2rtc-managed.yaml
+data/go2rtc-runtime.log
+data/archive-tmp
+__pycache__
+tests/__pycache__
+
+data/research-private/
+docs/private/
+docs/research/

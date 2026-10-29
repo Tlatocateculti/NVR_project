@@ -291,7 +291,7 @@
             cursor: default;
         }
         .cal-day-cell.has-recordings {
-            background: #1b382b;
+            background: #256b38;
             border-color: #2e7d32;
             color: #e8f5e9;
             font-weight: bold;
@@ -305,9 +305,8 @@
             margin-top: 2px;
         }
         .cal-day-cell.selected {
-            background: #1565C0 !important;
-            border-color: #64B5F6 !important;
-            color: #fff !important;
+            outline: 2px solid #64B5F6;
+            outline-offset: -2px;
             box-shadow: 0 0 6px rgba(33, 150, 243, 0.5);
         }
 
@@ -331,6 +330,39 @@
             color: white;
         }
         .btn-dl:hover { background: #4CAF50; }
+
+        #view-settings { display: none; height: 100%; overflow-y: auto; padding: 4px 2px 20px; }
+        .settings-content { max-width: 940px; margin: 0 auto; }
+        .settings-content h2 { font-size: 22px; margin: 18px 0 8px; }
+        .settings-intro, .settings-help { color: #aaa; font-size: 13px; line-height: 1.6; }
+        .settings-intro { margin: 0 0 24px; }
+        .settings-group { border: 1px solid #404040; border-radius: 8px; background: #242424; }
+        .settings-group summary { cursor: pointer; padding: 18px 20px; font-size: 16px; font-weight: 600; }
+        .settings-group summary::marker { color: #64b5f6; }
+        .settings-group[open] summary { border-bottom: 1px solid #3b3b3b; }
+        .settings-group-body { padding: 4px 20px 20px; }
+        .settings-fieldset { border: 1px solid #3d3d3d; border-radius: 6px; margin: 22px 0; padding: 16px; }
+        .settings-fieldset legend { padding: 0 8px; color: #ddd; font-size: 13px; font-weight: bold; }
+        .settings-folder-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+        .settings-folder-row input { min-width: 0; flex: 1; }
+        .settings-content input[type=text], .settings-content select { background: #181818; border: 1px solid #555; color: #eee; border-radius: 4px; padding: 10px; font-size: 13px; }
+        .settings-content button { padding: 10px 14px; white-space: nowrap; }
+        .settings-checkbox { display: flex; align-items: center; gap: 10px; margin-top: 20px; font-size: 14px; cursor: pointer; }
+        .settings-checkbox input { width: 17px; height: 17px; accent-color: #2196f3; flex-shrink: 0; }
+        .settings-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .settings-fields label { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+        .settings-fields select { width: 100%; }
+        .settings-error { color: #f2b8b5; }
+        #download-settings-status { min-height: 20px; color: #90caf9; font-size: 13px; }
+        #download-settings-status.settings-error { color: #f2b8b5; }
+        .settings-warning { background: #41341f; color: #ffdfa6; padding: 12px; border-radius: 5px; margin-top: 18px; font-size: 13px; line-height: 1.5; }
+        #download-notice { position: fixed; right: 24px; bottom: 24px; z-index: 50; width: 450px; max-width: calc(100vw - 48px); padding: 16px; background: #253344; border: 1px solid #5481ac; border-radius: 8px; box-shadow: 0 8px 30px #0008; }
+        #download-notice[data-state=error] { background: #452b2b; border-color: #b76565; }
+        #download-notice[data-state=success] { background: #233d2b; border-color: #589b70; }
+        #download-transfer-message { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; margin-bottom: 10px; }
+        #download-progress { width: 100%; accent-color: #64b5f6; }
+        .download-notice-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+        @media(max-width: 1000px) { .settings-fields { grid-template-columns: 1fr; } .settings-folder-row { flex-wrap: wrap; } }
     </style>
 </head>
 <body>
@@ -376,6 +408,9 @@
         <button id="tab-btn-recordings" class="tab-btn" onclick="switchMainTab('recordings')">
             <span>💾 Nagrania</span>
         </button>
+        <button id="tab-btn-settings" class="tab-btn" onclick="switchMainTab('settings')">
+            <span>⚙ Ustawienia</span>
+        </button>
     </nav>
 
     <!-- Kontener zawartości zakładek -->
@@ -418,13 +453,13 @@
 
                         <div style="margin-top: 10px; font-size: 11px; color: #aaa; display: flex; align-items: center; gap: 8px;">
                             <span style="display: inline-block; width: 8px; height: 8px; background: #4CAF50; border-radius: 50%;"></span>
-                            <span>Dni z dostępnymi nagraniami na kontrolerze</span>
+                            <span>Zielony: nagrania dla wybranej kamery · Szary: brak nagrań</span>
                         </div>
                     </div>
 
                     <!-- Pobieranie wybranego przedziału czasowego -->
                     <div class="panel" style="padding: 12px;">
-                        <h3 style="margin-top: 0; font-size: 14px;">Pobierz przedział czasowy (.avi)</h3>
+                        <h3 id="download-range-heading" style="margin-top: 0; font-size: 14px;">Pobierz przedział czasowy (AVI)</h3>
                         <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px;">
                             <div>
                                 <label style="color: #bbb; display: block; margin-bottom: 3px;">Od godziny:</label>
@@ -434,8 +469,8 @@
                                 <label style="color: #bbb; display: block; margin-bottom: 3px;">Do godziny:</label>
                                 <input type="time" id="range-end-time" value="23:59:59" step="1" style="width: 100%; padding: 6px; background: #333; color: white; border: 1px solid #555; border-radius: 4px;">
                             </div>
-                            <button class="btn-success" onclick="downloadCustomRangeAVI()" style="margin-top: 4px; padding: 9px 12px; font-size: 13px;">
-                                ⬇ Pobierz wskazany przedział (.avi)
+                            <button class="btn-success" data-download-label="range" onclick="downloadCustomRange()" style="margin-top: 4px; padding: 9px 12px; font-size: 13px;">
+                                ⬇ Pobierz wskazany przedział (AVI)
                             </button>
                         </div>
                     </div>
@@ -449,13 +484,15 @@
                     <div class="panel" style="padding: 10px; display: flex; flex-direction: column; flex-shrink: 0;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                             <span id="player-title" style="font-size: 13px; font-weight: bold; color: #2196F3;">Podgląd nagrania: Wybierz plik z tabeli poniżej</span>
-                            <button id="player-download-btn" style="padding: 4px 10px; font-size: 12px; background: #388E3C; display: none;" onclick="downloadCurrentPreviewAVI()">
-                                ⬇ Pobierz ten plik (.avi)
+                            <button id="player-download-btn" data-download-label="current" style="padding: 4px 10px; font-size: 12px; background: #388E3C; display: none;" onclick="downloadCurrentPreview()">
+                                ⬇ Pobierz ten plik (AVI)
                             </button>
                         </div>
                         <div style="width: 100%; height: 260px; background: #000; border-radius: 4px; overflow: hidden; position: relative;">
                             <video id="rec-preview-video" controls playsinline style="width: 100%; height: 100%; object-fit: contain;"></video>
+                            <div id="rec-preview-status" style="display: none; position: absolute; inset: 0; align-items: center; justify-content: center; padding: 20px; text-align: center; color: #f2b8b5; background: rgba(0, 0, 0, .78);"></div>
                         </div>
+                        <div style="font-size: 12px; color: #aaa; margin-top: 6px;">Podgląd obejmuje początek pliku (domyślnie do 60 s). Pobieranie obejmuje cały wybrany plik lub zakres; format, jakość i miejsce zapisu wybierzesz w Ustawieniach. Nagrania bez dźwięku.</div>
                     </div>
 
                     <!-- Tabela nagrań dla wybranego dnia -->
@@ -489,8 +526,61 @@
 
             </div>
         </div>
+
+        <div id="view-settings">
+            <div class="settings-content">
+                <h2>Ustawienia</h2>
+                <p class="settings-intro">Dostosuj aplikację do swojego sposobu pracy. Ustawienia pobierania zapisują się automatycznie w tej przeglądarce.</p>
+                <details class="settings-group" open>
+                    <summary>Pobieranie nagrań</summary>
+                    <div class="settings-group-body">
+                        <fieldset class="settings-fieldset">
+                            <legend>Miejsce zapisu</legend>
+                            <label for="download-folder">Domyślny folder nagrań na Twoim komputerze</label>
+                            <div class="settings-folder-row">
+                                <input id="download-folder" type="text" readonly aria-describedby="download-folder-help">
+                                <button id="download-choose-folder" type="button">Wybierz folder…</button>
+                            </div>
+                            <p id="download-folder-help" class="settings-help">Przy pierwszym wyborze proponujemy systemowy folder Filmy / Wideo. Wskaż katalog raz, aby zapisywać w nim kolejne nagrania. Przeglądarka udostępnia nazwę wybranego folderu, bez pełnej ścieżki.</p>
+                            <label class="settings-checkbox" for="download-ask"><input id="download-ask" type="checkbox">Za każdym razem pytaj, gdzie zapisać plik</label>
+                            <p class="settings-help">Po zaznaczeniu przy każdym pobraniu pojawi się okno „Zapisz jako”. Anulowanie wyboru nie rozpoczyna pobierania.</p>
+                        </fieldset>
+                        <fieldset class="settings-fieldset">
+                            <legend>Format i jakość</legend>
+                            <div class="settings-fields">
+                                <label for="download-format">Domyślny format
+                                    <select id="download-format"><option value="avi">AVI (.avi)</option><option value="mp4">MP4 (.mp4)</option></select>
+                                </label>
+                                <label for="download-quality">Jakość pobieranego obrazu
+                                    <select id="download-quality">
+                                        <option value="original">Oryginał — bez ponownej kompresji</option>
+                                        <option value="1080p">Wysoka — H.264, do 1080p</option>
+                                        <option value="720p">Standardowa — H.264, do 720p</option>
+                                        <option value="480p">Oszczędna — H.264, do 480p</option>
+                                    </select>
+                                </label>
+                            </div>
+                            <p id="download-format-note" class="settings-help"></p>
+                            <p class="settings-help">Wyższa jakość zajmuje więcej miejsca. Zmiana jakości może wydłużyć przygotowanie pliku. Eksport obecnie zawiera obraz bez dźwięku.</p>
+                        </fieldset>
+                        <div id="download-settings-status" role="status" aria-live="polite"></div>
+                        <div id="download-browser-warning" class="settings-warning" hidden></div>
+                    </div>
+                </details>
+            </div>
+        </div>
     </div>
 </main>
+
+
+<div id="download-notice" role="status" aria-live="polite" hidden>
+    <div id="download-transfer-message"></div>
+    <progress id="download-progress"></progress>
+    <div class="download-notice-actions">
+        <button id="download-cancel" type="button">Anuluj</button>
+        <button id="download-dismiss" type="button" hidden>Zamknij</button>
+    </div>
+</div>
 
 <script>
     let dvrDatabase = [];
@@ -498,12 +588,15 @@
     const enabledDvrIds = new Set();     // ID włączonych kontrolerów z lewego panelu
     const activePeerConnections = {};    // cellIndex -> RTCPeerConnection
     const cellStreamQuality = {};        // cellIndex -> 2 (SD) lub 1 (HQ)
+    const cellLiveRetryTimers = {};
+    const cellLiveRetryCounts = {};
     const cellActiveSelection = {};      // cellIndex -> { key: "dvrId:channel", label: "..." }
 
     // Stan modułu Nagrania
     let calCurrentYear = 2026;
     let calCurrentMonth = 10;           // 1-12
     let calSelectedDay = 27;            // Domyślnie dzisiejszy dzień
+    let calDaysRequest = 0;
     let calHighlightedDays = new Set(); // Dni z nagraniami pobrane z NVR
     let currentRecordingsList = [];     // Lista plików nagrań dla wybranego dnia
     let currentSelectedFile = null;     // Aktualnie podglądany plik
@@ -526,23 +619,17 @@
 
     // Przełączanie głównych zakładek bez resetowania strumieni WebRTC
     function switchMainTab(tabName) {
-        const liveBtn = document.getElementById('tab-btn-live');
-        const recBtn = document.getElementById('tab-btn-recordings');
-        const liveView = document.getElementById('view-live');
-        const recView = document.getElementById('view-recordings');
-
-        if (tabName === 'live') {
-            liveBtn.classList.add('active');
-            recBtn.classList.remove('active');
-            liveView.style.display = 'grid';
-            recView.style.display = 'none';
-        } else {
-            recBtn.classList.add('active');
-            liveBtn.classList.remove('active');
-            liveView.style.display = 'none';
-            recView.style.display = 'flex';
-            updateRecCameraSelect();
+        if (!['live', 'recordings', 'settings'].includes(tabName)) return;
+        for (const name of ['live', 'recordings', 'settings']) {
+            document.getElementById(`tab-btn-${name}`).classList.toggle('active', name === tabName);
+            document.getElementById(`view-${name}`).style.display = name === tabName
+                ? (name === 'live' ? 'grid' : name === 'recordings' ? 'flex' : 'block') : 'none';
         }
+        if (tabName === 'recordings') updateRecCameraSelect();
+    }
+
+    function downloadFormatLabel() {
+        return (window.nvrDownloadSettings?.format || 'avi').toUpperCase();
     }
 
     async function refreshDvrList(enableAllOnInit = false) {
@@ -681,6 +768,8 @@
     }
 
     function closeCellConnection(cellIndex) {
+        clearTimeout(cellLiveRetryTimers[cellIndex]);
+        delete cellLiveRetryTimers[cellIndex];
         if (activePeerConnections[cellIndex]) {
             try { activePeerConnections[cellIndex].close(); } catch (e) {}
             delete activePeerConnections[cellIndex];
@@ -737,6 +826,7 @@
     }
 
     function onCellSelectChange(cellIndex, selectEl) {
+        cellLiveRetryCounts[cellIndex] = 0;
         const val = selectEl.value;
         if (!val) {
             delete cellActiveSelection[cellIndex];
@@ -751,6 +841,7 @@
     }
 
     function toggleHQ(cellIndex) {
+        cellLiveRetryCounts[cellIndex] = 0;
         const current = cellStreamQuality[cellIndex] || 2;
         const next = current === 2 ? 1 : 2;
         cellStreamQuality[cellIndex] = next;
@@ -813,12 +904,33 @@
         });
     }
 
-    function fallbackToMp4Stream(cellIndex, dvrId, channel, stream) {
-        closeCellConnection(cellIndex);
-        const video = document.getElementById(`video-${cellIndex}`);
+    function retryLiveCell(cellIndex, video, dvrId, channel, stream) {
+        if (document.getElementById(`video-${cellIndex}`) !== video) return;
+        if (cellLiveRetryTimers[cellIndex]) return;
         const statusEl = document.getElementById(`status-${cellIndex}`);
-        if (!video) return;
-        if (statusEl) statusEl.textContent = stream === 1 ? '🟢 Live HQ' : '🟢 Live';
+        const attempt = (cellLiveRetryCounts[cellIndex] || 0) + 1;
+        cellLiveRetryCounts[cellIndex] = attempt;
+        if (attempt > 3) {
+            if (statusEl) statusEl.textContent = '🔴 Brak obrazu — wybierz kamerę ponownie';
+            return;
+        }
+        if (statusEl) statusEl.textContent = `Ponawianie połączenia (${attempt}/3)…`;
+        cellLiveRetryTimers[cellIndex] = setTimeout(() => {
+            delete cellLiveRetryTimers[cellIndex];
+            if (document.getElementById(`video-${cellIndex}`) !== video) return;
+            if (cellActiveSelection[cellIndex]?.key !== `${dvrId}:${channel}`) return;
+            if ((cellStreamQuality[cellIndex] || 2) !== stream) return;
+            loadChannelToCell(cellIndex, `${dvrId}:${channel}`);
+        }, 3000);
+    }
+
+    function fallbackToMp4Stream(cellIndex, dvrId, channel, stream, expectedVideo) {
+        const video = document.getElementById(`video-${cellIndex}`);
+        if (!video || video !== expectedVideo || video.dataset.fallback === 'true') return;
+        video.dataset.fallback = 'true';
+        closeCellConnection(cellIndex);
+        const statusEl = document.getElementById(`status-${cellIndex}`);
+        if (statusEl) statusEl.textContent = stream === 1 ? 'Łączenie HQ...' : 'Łączenie...';
         video.srcObject = null;
         video.src = `/api/stream.mp4?dvr_id=${dvrId}&channel=${channel}&stream=${stream}`;
         video.play().catch(() => {});
@@ -830,62 +942,53 @@
         const pc = new RTCPeerConnection();
         activePeerConnections[cellIndex] = pc;
         let receivedFrames = false;
-
+        let usingFallback = false;
+        const isCurrent = () => document.getElementById(`video-${cellIndex}`) === video;
+        const useFallback = () => {
+            if (!isCurrent() || usingFallback) return;
+            usingFallback = true;
+            clearTimeout(fallbackTimer);
+            fallbackToMp4Stream(cellIndex, dvrId, channel, stream, video);
+        };
         const fallbackTimer = setTimeout(() => {
-            if (!receivedFrames && activePeerConnections[cellIndex] === pc) {
-                fallbackToMp4Stream(cellIndex, dvrId, channel, stream);
-            }
-        }, 5000);
-
+            if (!receivedFrames && activePeerConnections[cellIndex] === pc) useFallback();
+        }, stream === 1 ? 20000 : 8000);
         video.onplaying = () => {
+            if (!isCurrent()) return;
             receivedFrames = true;
+            cellLiveRetryCounts[cellIndex] = 0;
             clearTimeout(fallbackTimer);
             if (statusEl) statusEl.textContent = stream === 1 ? '🟢 Live HQ' : '🟢 Live';
         };
-
-        pc.ontrack = (event) => {
-            if (video.srcObject !== event.streams[0]) {
+        video.onerror = () => {
+            if (!isCurrent()) return;
+            if (!usingFallback) useFallback();
+            else retryLiveCell(cellIndex, video, dvrId, channel, stream);
+        };
+        video.onended = () => retryLiveCell(cellIndex, video, dvrId, channel, stream);
+        pc.ontrack = event => {
+            if (isCurrent() && !usingFallback && video.srcObject !== event.streams[0]) {
                 video.srcObject = event.streams[0];
             }
         };
-
         pc.onconnectionstatechange = () => {
-            if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-                clearTimeout(fallbackTimer);
-                fallbackToMp4Stream(cellIndex, dvrId, channel, stream);
-            }
+            if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') useFallback();
         };
-
-        pc.addTransceiver("video", { direction: "recvonly" });
-
+        pc.addTransceiver('video', { direction: 'recvonly' });
         try {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             await waitForIceGathering(pc, 400);
-
+            if (!isCurrent() || usingFallback) return;
             const res = await fetch('/api/webrtc', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    dvr_id: dvrId,
-                    channel: channel,
-                    sdp: pc.localDescription.sdp,
-                    stream: stream
-                })
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dvr_id: dvrId, channel, sdp: pc.localDescription.sdp, stream })
             });
-
-            if (!res.ok) {
-                clearTimeout(fallbackTimer);
-                if (statusEl) statusEl.textContent = '🔴 Offline';
-                return;
-            }
-
+            if (!isCurrent() || usingFallback) return;
+            if (!res.ok) { useFallback(); return; }
             const answer = await res.json();
-            await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        } catch (err) {
-            clearTimeout(fallbackTimer);
-            fallbackToMp4Stream(cellIndex, dvrId, channel, stream);
-        }
+            if (isCurrent() && !usingFallback) await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        } catch (_) { useFallback(); }
     }
 
     /* ===============================================================
@@ -927,6 +1030,7 @@
         const sel = document.getElementById('rec-camera-select');
         const infoEl = document.getElementById('rec-camera-info');
         if (!sel || !sel.value) {
+            calDaysRequest++;
             calHighlightedDays.clear();
             renderCalendar();
             renderRecordingsTable([]);
@@ -940,20 +1044,26 @@
 
         if (infoEl) infoEl.textContent = 'Sprawdzanie nagrań na dysku...';
         await loadCalendarDays(dvrId, channel, calCurrentYear, calCurrentMonth);
-        if (infoEl) infoEl.textContent = `Dostępne dni z nagraniami: ${calHighlightedDays.size}`;
         
         await loadRecordingsForSelectedDate();
     }
 
     async function loadCalendarDays(dvrId, channel, year, month) {
+        const request = ++calDaysRequest;
+        const infoEl = document.getElementById('rec-camera-info');
         calHighlightedDays.clear();
+        renderCalendar();
+        if (infoEl) infoEl.textContent = 'Sprawdzanie dni z nagraniami…';
         try {
             const res = await fetch(`/api/recordings/days?dvr_id=${dvrId}&channel=${channel}&year=${year}&month=${month}`);
-            if (res.ok) {
-                const data = await res.json();
-                (data.days || []).forEach(d => calHighlightedDays.add(d));
-            }
+            if (!res.ok) throw new Error('Nie udało się odczytać dostępności nagrań.');
+            const data = await res.json();
+            if (request !== calDaysRequest) return;
+            calHighlightedDays = new Set((data.days || []).map(Number));
+            if (infoEl) infoEl.textContent = `Dostępne dni z nagraniami: ${calHighlightedDays.size}`;
         } catch (e) {
+            if (request !== calDaysRequest) return;
+            if (infoEl) infoEl.textContent = 'Nie udało się sprawdzić dni z nagraniami. Wybierz kamerę ponownie.';
             console.error('Błąd pobierania dni nagrań:', e);
         }
         renderCalendar();
@@ -1010,6 +1120,7 @@
 
             cell.className = `cal-day-cell ${hasRec ? 'has-recordings' : ''} ${isSel ? 'selected' : ''}`;
             cell.textContent = day;
+            cell.title = hasRec ? 'Dostępne nagrania' : 'Brak nagrań';
             cell.onclick = () => selectCalendarDay(day);
 
             gridEl.appendChild(cell);
@@ -1100,7 +1211,7 @@
                 <td style="padding: 8px; text-align: center;">
                     <div style="display: flex; gap: 6px; justify-content: center;">
                         <button class="btn-action btn-play" onclick='playRecordingPreview(${JSON.stringify(f)})'>▶ Odtwórz</button>
-                        <button class="btn-action btn-dl" onclick='downloadRecordingFileAVI(${JSON.stringify(f)})'>⬇ Pobierz AVI</button>
+                        <button class="btn-action btn-dl" data-download-label="file" onclick='downloadRecordingFile(${JSON.stringify(f)})'>⬇ Pobierz (${downloadFormatLabel()})</button>
                     </div>
                 </td>
             `;
@@ -1108,9 +1219,16 @@
         });
     }
 
-    function playRecordingPreview(fileItem) {
+    let recPreviewAbort = null;
+    let recPreviewObjectUrl = null;
+
+    async function playRecordingPreview(fileItem) {
+        if (recPreviewAbort) recPreviewAbort.abort();
+        const controller = new AbortController();
+        recPreviewAbort = controller;
         currentSelectedFile = fileItem;
         const video = document.getElementById('rec-preview-video');
+        const statusEl = document.getElementById('rec-preview-status');
         const titleEl = document.getElementById('player-title');
         const dlBtn = document.getElementById('player-download-btn');
         const sel = document.getElementById('rec-camera-select');
@@ -1127,50 +1245,77 @@
 
         // Nowa próba podglądu nie może użyć starego pliku z pamięci przeglądarki.
         const url = `/api/recordings/preview?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&filename=${encodeURIComponent(fileItem.filename)}&start_time=${encodeURIComponent(fileItem.time_only_start)}&end_time=${encodeURIComponent(fileItem.time_only_end)}&_=${Date.now()}`;
-        video.src = url;
-        video.play().catch(() => {});
+        if (statusEl) {
+            statusEl.textContent = 'Pobieranie nagrania z rejestratora…';
+            statusEl.style.display = 'flex';
+            statusEl.style.color = '#ddd';
+        }
+        video.removeAttribute('src');
+        video.load();
+        if (recPreviewObjectUrl) {
+            URL.revokeObjectURL(recPreviewObjectUrl);
+            recPreviewObjectUrl = null;
+        }
+
+        try {
+            const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
+            if (!response.ok) {
+                let detail = `Serwer zwrócił błąd ${response.status}.`;
+                try {
+                    const body = await response.json();
+                    if (body && body.detail) detail = body.detail;
+                } catch (_) {}
+                throw new Error(detail);
+            }
+            const blob = await response.blob();
+            if (!blob.size) throw new Error('Rejestrator nie zwrócił danych nagrania.');
+            if (controller.signal.aborted) return;
+            recPreviewObjectUrl = URL.createObjectURL(blob);
+            video.src = recPreviewObjectUrl;
+            const seconds = response.headers.get('X-Preview-Seconds');
+            if (titleEl && seconds) titleEl.textContent += ` • podgląd ${seconds} s, bez dźwięku`;
+            try { await video.play(); } catch (error) {
+                if (error.name !== 'NotAllowedError' && error.name !== 'AbortError') throw error;
+            }
+            if (statusEl) statusEl.style.display = 'none';
+        } catch (error) {
+            if (controller.signal.aborted) return;
+            if (statusEl) {
+                statusEl.textContent = error.message || 'Nie udało się odtworzyć nagrania.';
+                statusEl.style.display = 'flex';
+                statusEl.style.color = '#f2b8b5';
+            }
+        }
     }
 
-    function downloadCurrentPreviewAVI() {
+    function downloadCurrentPreview() {
         if (!currentSelectedFile) return alert('Najpierw wybierz nagranie z tabeli!');
-        downloadRecordingFileAVI(currentSelectedFile);
+        downloadRecordingFile(currentSelectedFile);
     }
 
-    function downloadRecordingFileAVI(fileItem) {
+    function downloadRecordingFile(fileItem) {
         const sel = document.getElementById('rec-camera-select');
         if (!sel || !sel.value) return alert('Wybierz kamerę!');
         const [dvrIdStr, chStr] = sel.value.split(':');
-        const dateStr = getFormattedSelectedDate();
-
-        const url = `/api/recordings/download?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&filename=${encodeURIComponent(fileItem.filename)}&start_time=${encodeURIComponent(fileItem.time_only_start)}&end_time=${encodeURIComponent(fileItem.time_only_end)}`;
-        
-        // Wywołujemy natywny download w przeglądarce
-        const a = document.createElement('a');
-        a.href = url;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        window.requestRecordingDownload({
+            dvr_id: dvrIdStr, channel: chStr, date: getFormattedSelectedDate(),
+            filename: fileItem.filename,
+            start_time: fileItem.time_only_start, end_time: fileItem.time_only_end,
+        });
     }
 
-    function downloadCustomRangeAVI() {
+    function downloadCustomRange() {
         const sel = document.getElementById('rec-camera-select');
         if (!sel || !sel.value) return alert('Wybierz kamerę do pobrania!');
         const [dvrIdStr, chStr] = sel.value.split(':');
-        const dateStr = getFormattedSelectedDate();
-
-        const sTime = document.getElementById('range-start-time').value.trim() || '00:00:00';
-        const eTime = document.getElementById('range-end-time').value.trim() || '23:59:59';
-
-        const url = `/api/recordings/download?dvr_id=${dvrIdStr}&channel=${chStr}&date=${dateStr}&start_time=${encodeURIComponent(sTime)}&end_time=${encodeURIComponent(eTime)}`;
-        
-        const a = document.createElement('a');
-        a.href = url;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        window.requestRecordingDownload({
+            dvr_id: dvrIdStr, channel: chStr, date: getFormattedSelectedDate(),
+            start_time: document.getElementById('range-start-time').value.trim() || '00:00:00',
+            end_time: document.getElementById('range-end-time').value.trim() || '23:59:59',
+        });
     }
+
 </script>
+<script type="module" src="/static/downloads.mjs?v=2"></script>
 </body>
 </html>
