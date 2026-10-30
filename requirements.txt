@@ -3,3 +3,6 @@ uvicorn
 pydantic
 jinja2
 python-dvr
+authlib
+itsdangerous
+httpx

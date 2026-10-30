@@ -20,3 +20,7 @@ docs/research/
 # Local Codex workspace metadata
 .agents/
 .codex/
+
+# Local OAuth configuration
+.env
+data/client_secret_*.json

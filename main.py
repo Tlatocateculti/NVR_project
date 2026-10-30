@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, RedirectResponse
 from starlette.background import BackgroundTask
+from starlette.middleware.sessions import SessionMiddleware
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -12,6 +13,7 @@ import mimetypes
 from quii_archive import ArchiveError, Recording, save_video, convert_video
 from local_runtime import LocalRelay
 from live_proxy import open_mp4_proxy
+from auth import callback_url, oauth, settings as auth_settings
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -54,8 +56,32 @@ GO2RTC_RTSP = os.environ.get(
 ).rstrip("/")
 LIVE_STREAM_LOCK = Lock()
 LIVE_STREAM_SIGNATURES = {}
+STREAM_COLOR_NORMALIZATION: dict[str, bool] = {}
 
 os.makedirs("data", exist_ok=True)
+
+
+@app.middleware("http")
+async def require_login_for_application(request: Request, call_next):
+    """Keep the login callback public; protect every application/API route."""
+    if not auth_settings.enabled:
+        return await call_next(request)
+    path = request.url.path
+    public = path.startswith("/login") or path.startswith("/auth/") or path.startswith("/static/")
+    if public or request.session.get("user"):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return JSONResponse(status_code=401, content={"detail": "Wymagane jest zalogowanie."})
+    return RedirectResponse(url="/login", status_code=303)
+
+
+# Register after the function middleware so the session is available to it.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=auth_settings.session_secret or secrets.token_urlsafe(48),
+    same_site="lax",
+    https_only=auth_settings.cookie_secure,
+)
 
 
 class NVR(BaseModel):
@@ -140,26 +166,30 @@ def fetch_tdkcgi_channels(nvr: NVR) -> list[dict] | None:
             detail=f"Rejestrator zwrócił błąd autoryzacji/komendy (kod={err_code}).",
         )
 
-    online_map: dict[int, bool] = {}
-    status_root = tdk_send_command(nvr.ip, nvr.user, nvr.password, "get.channelmanagement.status")
-    if status_root is not None:
-        for ch_st in status_root.findall(".//channel"):
-            cid = ch_st.findtext("id")
-            conn_state = (ch_st.findtext(".//connection") or "").strip().lower()
-            if cid and cid.isdigit():
-                online_map[int(cid)] = (conn_state == "connected")
-
     channels = []
     for idx, ch_el in enumerate(root.findall(".//ch")):
         id_text = ch_el.findtext("id")
         name_text = ch_el.findtext("name")
         ch_num = int(id_text) if id_text and id_text.isdigit() else (idx + 1)
         ch_name = (name_text or "").strip() or f"Kanał {ch_num}"
-        if ch_num in online_map and not online_map[ch_num]:
-            ch_name = f"{ch_name} [offline]"
         channels.append({"channel_number": ch_num, "name": ch_name})
 
     return channels
+
+
+def fetch_tdkcgi_channel_status(nvr: NVR) -> dict[int, bool] | None:
+    """Read transient camera connection state without changing stored names."""
+    root = tdk_send_command(nvr.ip, nvr.user, nvr.password, "get.channelmanagement.status")
+    if root is None:
+        return None
+
+    states: dict[int, bool] = {}
+    for channel in root.findall(".//channel"):
+        channel_id = channel.findtext("id")
+        connection = (channel.findtext(".//connection") or "").strip().lower()
+        if channel_id and channel_id.isdigit():
+            states[int(channel_id)] = connection == "connected"
+    return states
 
 
 class SafeDVRIPCam(DVRIPCam):
@@ -266,6 +296,9 @@ def init_db():
                   channel_number INTEGER,
                   name TEXT,
                   FOREIGN KEY(dvr_id) REFERENCES dvrs(id) ON DELETE CASCADE)''')
+    # Connection state is transient and must never be persisted as part of a
+    # channel name. Remove labels written by older versions of the application.
+    c.execute("UPDATE channels SET name = REPLACE(name, ' [offline]', '') WHERE name LIKE '% [offline]'")
     conn.commit()
     conn.close()
 
@@ -351,9 +384,10 @@ def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
     # Dla strumienia głównego (HQ, ids=1), który często jest kodowany w H.265 (HEVC),
     # dodajemy drugie źródło ffmpeg->H.264, aby WebRTC działało w przeglądarkach bez wsparcia HEVC.
     if stream_id == 1:
-        # Reuse go2rtc's local RTSP relay for transcoding. FFmpeg does not
-        # need another remote NVR connection or credentials in its command.
-        params.append(("src", f"ffmpeg:{stream_name}#video=h264#timeout=15"))
+        # This must use the camera/NVR RTSP URL, not ``stream_name`` itself.
+        # Referencing the stream being constructed creates a loop, so go2rtc
+        # never gets a decodable H.264 track for HEVC-only HQ sources.
+        params.append(("src", f"ffmpeg:{rtsp_qv}#video=h264#timeout=15"))
 
     signature = hashlib.sha256(repr(params).encode("utf-8")).digest()
     with LIVE_STREAM_LOCK:
@@ -368,16 +402,106 @@ def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
     return stream_name
 
 
+def stream_needs_color_normalization(stream_name: str) -> bool:
+    """Detect broken H.264 VUI colour metadata once per active stream."""
+    cached = STREAM_COLOR_NORMALIZATION.get(stream_name)
+    if cached is not None:
+        return cached
+
+    ffprobe = os.environ.get("FFPROBE_BIN") or shutil.which("ffprobe")
+    if not ffprobe:
+        STREAM_COLOR_NORMALIZATION[stream_name] = False
+        return False
+
+    source = f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264"
+    try:
+        probe = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-rtsp_transport", "tcp", "-timeout", "8000000",
+                "-show_entries", "stream=color_space,color_transfer,color_primaries",
+                "-of", "default=noprint_wrappers=1", source,
+            ],
+            capture_output=True, text=True, timeout=12, check=False,
+        )
+        details = dict(
+            line.split("=", 1) for line in probe.stdout.splitlines() if "=" in line
+        )
+        normalize = (
+            details.get("color_space") == "gbr"
+            or details.get("color_transfer") == "reserved"
+            or details.get("color_primaries") == "reserved"
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        normalize = False
+    STREAM_COLOR_NORMALIZATION[stream_name] = normalize
+    return normalize
+
+
 @app.get("/")
 async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
+
+
+@app.get("/login")
+async def login_page(request: Request, error: str | None = None):
+    if not auth_settings.enabled:
+        return RedirectResponse(url="/", status_code=303)
+    return templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={"providers": auth_settings.providers, "error": error},
+    )
+
+
+@app.get("/login/{provider}")
+async def start_login(request: Request, provider: str):
+    if not auth_settings.enabled or provider not in auth_settings.providers:
+        raise HTTPException(status_code=404, detail="Wybrany dostawca logowania nie jest skonfigurowany.")
+    client = oauth.create_client(provider)
+    return await client.authorize_redirect(request, callback_url(request, provider))
+
+
+@app.get("/auth/{provider}/callback", name="auth_callback")
+async def auth_callback(request: Request, provider: str):
+    if not auth_settings.enabled or provider not in auth_settings.providers:
+        raise HTTPException(status_code=404, detail="Wybrany dostawca logowania nie jest skonfigurowany.")
+    try:
+        client = oauth.create_client(provider)
+        token = await client.authorize_access_token(request)
+        userinfo = token.get("userinfo") or await client.userinfo(token=token)
+        email = userinfo.get("email") or userinfo.get("preferred_username")
+        subject = userinfo.get("sub")
+        if not email or not subject:
+            raise ValueError("Dostawca nie przekazał wymaganych danych konta.")
+    except Exception:
+        return RedirectResponse(url="/login?error=Nie+udało+się+potwierdzić+logowania.", status_code=303)
+    request.session.clear()
+    request.session["user"] = {
+        "provider": provider,
+        "subject": str(subject),
+        "email": str(email),
+        "name": str(userinfo.get("name") or email),
+    }
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/login" if auth_settings.enabled else "/", status_code=303)
+
+
+@app.get("/api/session")
+async def get_session(request: Request):
+    """Return only the currently signed-in user's display information."""
+    return {"user": request.session.get("user")}
 
 
 @app.get("/api/dvrs")
 async def get_dvrs():
     conn = sqlite3.connect('data/dvrs.db')
     c = conn.cursor()
-    c.execute("SELECT id, name, ip, port, user, password FROM dvrs")
+    c.execute("SELECT id, name, ip, port FROM dvrs")
     dvr_rows = c.fetchall()
 
     result = []
@@ -393,8 +517,6 @@ async def get_dvrs():
             "name": r[1],
             "ip": r[2],
             "port": r[3],
-            "user": r[4],
-            "password": r[5],
             "channels": channels
         })
 
@@ -413,6 +535,25 @@ async def get_dvr_channels(dvr_id: int):
     rows = c.fetchall()
     conn.close()
     return [{"channel_number": r[0], "name": r[1]} for r in rows]
+
+
+@app.get("/api/dvrs/status")
+async def get_dvr_channel_status():
+    """Return the current NVR-reported state; it is never persisted."""
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        rows = conn.execute("SELECT id, ip, port, user, password FROM dvrs").fetchall()
+    finally:
+        conn.close()
+
+    result: dict[str, dict[str, bool]] = {}
+    for dvr_id, ip, port, user, password in rows:
+        statuses = fetch_tdkcgi_channel_status(
+            NVR(name="", ip=ip, port=port, user=user, password=password)
+        )
+        if statuses is not None:
+            result[str(dvr_id)] = {str(channel): online for channel, online in statuses.items()}
+    return {"channels": result}
 
 
 @app.post("/api/dvrs/test")
@@ -449,6 +590,11 @@ def start_webrtc_session(offer: WebRTCOffer, request: Request):
     """Rejestruje strumień RTSP (#media=video) w go2rtc i zwraca SDP Answer z lokalnym kandydatem ICE."""
     try:
         stream_name = ensure_go2rtc_stream(offer.dvr_id, offer.channel, offer.stream)
+        if stream_needs_color_normalization(stream_name):
+            raise HTTPException(
+                status_code=409,
+                detail="Ten strumień wymaga zgodnej konwersji kolorów.",
+            )
 
         w_req = urllib.request.Request(
             f"{GO2RTC_API}/api/webrtc?src={urllib.parse.quote(stream_name)}",
@@ -491,7 +637,7 @@ def proxy_mp4_stream(dvr_id: int, channel: int, stream: int = 2):
         raise HTTPException(status_code=503, detail="Brak FFmpeg do podglądu obrazu.")
     source = f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264"
     try:
-        proxy = open_mp4_proxy(binary, source)
+        proxy = open_mp4_proxy(binary, source, stream_needs_color_normalization(stream_name))
     except OSError as exc:
         raise HTTPException(status_code=502, detail="Nie udało się odebrać obrazu z przekaźnika.") from exc
     return StreamingResponse(proxy.chunks(), media_type="video/mp4",

@@ -1,6 +1,8 @@
 .git
 .agents
 .codex
+.env
+data/client_secret_*.json
 tools/*.exe
 data/dvrs.db
 data/dvrs.db-*
