@@ -9,6 +9,7 @@ data/dvrs.db-*
 data/go2rtc-managed.yaml
 data/go2rtc-runtime.log
 data/archive-tmp
+data/archive-jobs
 __pycache__
 tests/__pycache__
 

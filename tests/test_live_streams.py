@@ -47,6 +47,32 @@ class LiveTests(unittest.TestCase):
             self.assertIn("video=h264", url)
             self.assertTrue(url.startswith("rtsp://"))
 
+    def test_qualvision_camera_uses_main_profile_for_hq(self):
+        substream = "/mode=real&idc=1&ids=2"
+        self.assertEqual(main.camera_rtsp_path_for_stream(substream, 2), substream)
+        self.assertEqual(main.camera_rtsp_path_for_stream(substream, 1), "/mode=real&idc=1&ids=1")
+
+    def test_other_camera_rtsp_path_is_not_rewritten_for_hq(self):
+        path = "/Streaming/Channels/101"
+        self.assertEqual(main.camera_rtsp_path_for_stream(path, 1), path)
+
+    def test_registered_nvr_credentials_do_not_replace_explicit_camera_password(self):
+        camera = main.Camera(name="", ip="192.0.2.56", user="admin", password="camera-password")
+        with patch("main.camera_connection_from_registered_nvr", return_value=("nvr-user", "nvr-password", "quvii")), \
+                patch("main.detect_camera_rtsp_path", return_value="/mode=real&idc=1&ids=2"):
+            main.resolve_camera_connection(camera)
+        self.assertEqual((camera.user, camera.password), ("admin", "camera-password"))
+        self.assertEqual(camera.rtsp_path, "/mode=real&idc=1&ids=2")
+
+    def test_port_fingerprint_prefers_camera_media_port_and_recorder_https(self):
+        self.assertEqual(main.classify_host("192.0.2.12", {80, 554, 5801, 49152}), "camera")
+        self.assertEqual(main.classify_host("192.0.2.251", {80, 443, 554}), "nvr")
+
+    def test_vendor_fingerprint_uses_public_http_metadata(self):
+        self.assertEqual(main.vendor_from_http_fingerprint("Kenik -HTTPServer"), "Kenik")
+        self.assertEqual(main.vendor_from_http_fingerprint("Server: Qualvision -HTTPServer"), "Qualvision")
+        self.assertEqual(main.vendor_from_http_fingerprint("Hikvision Web Components"), "Hikvision")
+
 
 if __name__ == "__main__":
     unittest.main()

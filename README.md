@@ -45,6 +45,23 @@ docker compose up -d --build
 
 Po włączeniu logowania każda strona aplikacji i każde `/api/*` wymaga sesji.
 
+## Wykrywanie urządzeń w innych podsieciach
+
+Automatyczne wyszukiwanie używa ONVIF/UPnP oraz tras lokalnego hosta. Przycisk
+**Przeskanuj wszystkie sieci lokalne** pokazuje aktualnie skanowaną podsieć i
+pozwala anulować pracę. Sieć, w której znajdzie urządzenie, zostaje zapamiętana
+i będzie uwzględniana w kolejnych szybkich skanach.
+
+Można także dopisać dodatkowe CIDR-y do `.env` (np. trasę VLAN niedostępną
+bezpośrednio na hoście):
+
+```sh
+DISCOVERY_NETWORKS=192.168.49.0/24,10.20.0.0/24
+docker compose up -d --build
+```
+
+Zakresy wpisane w polu wyszukiwania nadal mają pierwszeństwo.
+
 ## Testy
 
 ```sh

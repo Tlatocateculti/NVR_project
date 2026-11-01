@@ -91,6 +91,43 @@ MP4 w jakości oryginalnej zachowuje HEVC, jeśli taki jest kodek kamery; zgodno
 odtwarzacza wymaga wtedy HEVC. Profile przetwarzane używają H.264. Limit czasu
 ich konwersji ustawia ARCHIVE_CONVERT_TIMEOUT (domyślnie 3600 s).
 
+Opcja **Anonimowość** zasłania czarną maską całą wykrytą głowę, zanim plik trafi
+do przeglądarki. Detekcja działa lokalnie na CPU modelem Intel Open Model Zoo
+`face-detection-retail-0004`. Obraz CCTV jest analizowany nakładającymi się
+kaflami w pełnej skali, a duplikaty są odrzucane jednym wspólnym NMS; nie
+używa kaskad Haar, ponieważ dają one fałszywe trafienia na meblach i tablicach.
+Jest zapamiętywana oddzielnie w każdej
+przeglądarce, dotyczy pliku i zakresu oraz zawsze koduje wynik do H.264 — także
+gdy wybrano jakość „oryginał”. Detekcja jest automatyczna, dlatego przed
+udostępnieniem materiału warto sprawdzić gotowy plik; przy włączonej opcji
+oryginalne, niezamaskowane nagranie nie jest wysyłane do klienta.
+
+Eksport anonimowy jest ponownie kodowany profilem nastawionym na szybkość;
+rozmiar gotowego pliku może być większy niż źródła. Detektor nie zastępuje
+kontroli gotowego materiału w sytuacjach, w których wymagana jest bezwzględna
+anonimizacja każdej osoby (np. twarze zasłonięte, odwrócone lub bardzo małe).
+Liczba wątków jest dobierana automatycznie na podstawie rdzeni przydzielonych
+kontenerowi i liczby równoległych eksportów (`ARCHIVE_MAX_CONCURRENT_JOBS`,
+domyślnie 2), z limitem 8 wątków na eksport. Ustaw zmienną
+`ARCHIVE_ANONYMIZE_THREADS` na liczbę, aby ręcznie to nadpisać.
+Model osób Intel Open Model Zoo `person-detection-0202` jest sprawdzany w
+każdej klatce, a detektor twarzy doprecyzowuje maskę głowy. Położenie maski jest
+zatem wyliczane z bieżącej sylwetki i nie zostaje na krześle ani tle po wyjściu
+człowieka. Gdy twarz jest odwrócona lub na chwilę zasłonięta, maskowana jest
+ograniczona górna część aktualnie potwierdzonej sylwetki.
+`ARCHIVE_ANONYMIZE_KEYFRAME_INTERVAL` określa odstęp detekcji twarzy
+(domyślnie 12); mniejsza wartość szybciej doprecyzowuje maskę, ale wydłuża eksport.
+
+Maska obejmuje całą głowę, nie tylko prostokąt twarzy. Wykryte osoby są
+kojarzone między kolejnymi klatkami, ale narysowanie maski zawsze wymaga bieżącej
+sylwetki. Gdy zaznaczono anonimizację, analiza zawsze otrzymuje pełną jakość
+źródłowego archiwum; ewentualne zmniejszenie jakości następuje dopiero po
+zasłonięciu głów.
+
+Eksporty trafiają do trwałej kolejki z limitem dwóch równoległych zadań dla
+całej aplikacji. Zakładka **Pobrania** pokazuje historię danego użytkownika,
+bieżący etap, postęp, czas pracy, miejsce w kolejce i orientacyjny czas końca.
+
 Zapis jest strumieniowy, bez buforowania całego nagrania w RAM. Niepełny transfer
 lub anulowanie nie zatwierdza nadpisania istniejącego pliku. W folderze domyślnym
 powtórzona nazwa otrzymuje kolejny numer. Wybrany ręcznie istniejący plik może

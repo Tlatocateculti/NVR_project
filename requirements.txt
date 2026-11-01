@@ -6,3 +6,6 @@ python-dvr
 authlib
 itsdangerous
 httpx
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+openvino==2024.6.0

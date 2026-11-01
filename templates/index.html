@@ -27,6 +27,8 @@
             height: 100%;
             overflow-y: auto;
         }
+        .sidebar > .panel:first-child { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+        .sidebar > .panel:first-child > .nvr-list { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; padding-right: 4px; }
         .panel {
             padding: 14px;
             background: #242424;
@@ -92,6 +94,43 @@
             font-size: 12px;
             color: #aaa;
         }
+        .device-category { border: 1px solid #3f3f3f; border-radius: 5px; overflow: hidden; }
+        .device-category summary { cursor: pointer; padding: 8px 10px; font-size: 13px; color: #ddd; background: #292929; }
+        .device-category-actions { float: right; font-size: 11px; color: #aaa; }
+        .device-category .nvr-list { max-height: none; overflow: visible; padding: 6px; }
+        .device-type { font-size: 10px; padding: 2px 5px; border-radius: 8px; background: #37516d; color: #d9edff; width: fit-content; }
+        #view-devices { min-height: 0; }
+        .devices-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(300px, .8fr); gap: 16px; height: 100%; min-height: 0; overflow: hidden; padding: 4px; }
+        .devices-layout > section { min-height: 0; }
+        .discovery-panel { display: flex; flex-direction: column; overflow: hidden; }
+        .discovery-results { flex: 1 1 auto; min-height: 0; overflow: auto; border: 1px solid #3c3c3c; border-radius: 4px; }
+        .devices-layout h2 { margin-top: 0; }
+        .devices-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .devices-table th, .devices-table td { padding: 9px; border-bottom: 1px solid #3c3c3c; text-align: left; }
+        .devices-table th { color: #aaa; }
+        .devices-table th button { padding: 0; margin: 0; width: auto; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+        .devices-table th button:hover { color: #fff; }
+        .devices-table thead { position: sticky; top: 0; background: #292929; z-index: 1; }
+        .devices-result-empty { padding: 25px; text-align: center; color: #888; }
+        .device-menu { margin-left: auto; padding: 3px 8px; background: transparent; color: #bbb; font-size: 18px; line-height: 1; }
+        .device-menu:hover { background: #4a4a4a; color: white; }
+        .modal-backdrop { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.65); }
+        .modal-backdrop[hidden] { display: none; }
+        .config-modal { width: min(520px, 100%); max-height: calc(100vh - 40px); overflow-y: auto; background: #242424; border: 1px solid #555; border-radius: 8px; padding: 20px; box-shadow: 0 18px 60px #000; }
+        .config-modal h2 { margin: 0 0 16px; font-size: 18px; }
+        .config-modal label { display: flex; flex-direction: column; gap: 6px; margin: 11px 0; font-size: 13px; color: #ccc; }
+        .config-modal input { padding: 9px; color: #fff; background: #181818; border: 1px solid #555; border-radius: 4px; }
+        .config-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+        #full-scan-modal .config-modal { width: min(760px, 100%); }
+        .network-selection-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .network-selection-table th, .network-selection-table td { padding: 9px 10px; border-bottom: 1px solid #3c3c3c; text-align: left; vertical-align: middle; }
+        .network-selection-table th { position: sticky; top: 0; z-index: 1; background: #292929; color: #aaa; font-weight: 600; }
+        .network-selection-table tbody tr:hover { background: #2d2d2d; }
+        .network-selection-table td:first-child { width: 54px; text-align: center; }
+        .network-selection-table td:last-child { width: 82px; text-align: right; }
+        .network-selection-table input[type="checkbox"] { width: 17px; height: 17px; accent-color: #2196f3; }
+        .network-remove { margin: 0; padding: 5px 9px; width: auto; color: #ffb4ad; border-color: #83413c; background: #3a2422; }
+        .network-remove:hover { background: #572d29; }
 
         /* Przyciski układu siatki */
         .grid-buttons {
@@ -122,6 +161,14 @@
             background: #333;
             color: white;
         }
+        .password-field { position: relative; width: 100%; }
+        .password-field input { padding-right: 42px; }
+        .password-toggle {
+            position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+            width: 34px; height: 30px; padding: 0; border: 0; background: transparent;
+            color: #c8c8c8; font-size: 18px; line-height: 1;
+        }
+        .password-toggle:hover { background: #4a4a4a; color: #fff; }
         button {
             padding: 8px 14px;
             cursor: pointer;
@@ -181,6 +228,8 @@
             border-top: 3px solid #2196F3;
             font-weight: bold;
         }
+        .tab-btn[draggable=true] { cursor: grab; }
+        .tab-btn.dragging { opacity: .45; cursor: grabbing; }
 
         /* Kontener widoków */
         .views-container {
@@ -389,10 +438,10 @@
 </head>
 <body>
 
-<!-- Niezależny lewy panel boczny z kontrolerami (NVR) -->
+<!-- Niezależny lewy panel boczny z urządzeniami -->
 <aside class="sidebar">
     <div class="panel">
-        <h3>Kontrolery (Rejestratory)</h3>
+        <h3>Urządzenia</h3>
         <div id="nvr-list" class="nvr-list">
             <div style="color: #888; font-size: 13px;">Ładowanie...</div>
         </div>
@@ -407,17 +456,6 @@
         </div>
     </div>
 
-    <div class="panel">
-        <h3>Dodaj rejestrator</h3>
-        <div class="form-group">
-            <input type="text" id="nvr-name" placeholder="Nazwa robocza (np. 103)" required>
-            <input type="text" id="nvr-ip" placeholder="Adres IP" required>
-            <input type="number" id="nvr-port" placeholder="Port" value="34567" required>
-            <input type="text" id="nvr-user" placeholder="Użytkownik" value="admin" required>
-            <input type="password" id="nvr-pass" placeholder="Hasło" required>
-            <button class="btn-success" onclick="addDVR()">Testuj połączenie i Zapisz</button>
-        </div>
-    </div>
 </aside>
 
 <section id="signed-in-user" class="signed-in-user" aria-label="Zalogowany użytkownik" hidden>
@@ -432,13 +470,19 @@
 <main class="main-area">
     <!-- Pasek zakładek w stylu przeglądarkowym -->
     <nav class="tabs-nav">
-        <button id="tab-btn-live" class="tab-btn active" onclick="switchMainTab('live')">
+        <button id="tab-btn-live" class="tab-btn active" draggable="true" onclick="switchMainTab('live')">
             <span>📹 Widok z kamer</span>
         </button>
-        <button id="tab-btn-recordings" class="tab-btn" onclick="switchMainTab('recordings')">
+        <button id="tab-btn-recordings" class="tab-btn" draggable="true" onclick="switchMainTab('recordings')">
             <span>💾 Nagrania</span>
         </button>
-        <button id="tab-btn-settings" class="tab-btn" onclick="switchMainTab('settings')">
+        <button id="tab-btn-downloads" class="tab-btn" draggable="true" onclick="switchMainTab('downloads')">
+            <span>⬇ Pobrania</span>
+        </button>
+        <button id="tab-btn-devices" class="tab-btn" draggable="true" onclick="switchMainTab('devices')">
+            <span>📡 Urządzenia</span>
+        </button>
+        <button id="tab-btn-settings" class="tab-btn" draggable="true" onclick="switchMainTab('settings')">
             <span>⚙ Ustawienia</span>
         </button>
     </nav>
@@ -557,6 +601,50 @@
             </div>
         </div>
 
+        <div id="view-downloads" style="display:none; overflow:auto; padding:16px;">
+            <section class="panel">
+                <h2 style="margin-top:0;">Pobrania</h2>
+                <p class="settings-help">Maksymalnie dwa nagrania są przygotowywane jednocześnie. Historia jest przypisana do zalogowanego użytkownika lub tej przeglądarki.</p>
+                <div id="download-jobs-current" class="settings-help">Brak aktywnych pobrań.</div>
+                <h3 style="margin:20px 0 8px;">Historia</h3>
+                <div style="overflow-x:auto;"><table class="devices-table"><thead><tr><th>Dzień i godzina</th><th>Rejestrator / kamera</th><th>Zakres nagrania</th><th>Anonimizacja</th><th>Stan</th><th></th></tr></thead><tbody id="download-jobs-history"><tr><td colspan="6" class="devices-result-empty">Ładowanie historii…</td></tr></tbody></table></div>
+            </section>
+        </div>
+
+        <div id="view-devices" style="display:none; height:100%;">
+            <div class="devices-layout">
+                <section class="panel discovery-panel">
+                    <h2>Wykrywanie urządzeń</h2>
+                    <p class="settings-intro">Najpierw podaj adres IP, zakres (np. <code>192.168.1.20-192.168.1.80</code>) lub podsieć (<code>192.168.1.0/24</code>). Bez zakresu użyjemy ONVIF Plug &amp; Play oraz przeskanujemy podsieci zapisanych urządzeń.</p>
+                    <div class="form-group" style="flex-direction:row; align-items:center; margin-bottom:12px;">
+                        <input id="scan-targets" type="text" placeholder="Adres IP / zakres / CIDR (opcjonalnie)" style="flex:1;">
+                        <input id="scan-user" type="text" placeholder="Użytkownik (opcjonalnie)" style="max-width:150px;">
+                        <span class="password-field" style="max-width:170px;"><input id="scan-pass" type="password" placeholder="Hasło do rozpoznania NVR"><button class="password-toggle" type="button" aria-label="Pokaż hasło" title="Pokaż hasło" onclick="togglePasswordVisibility('scan-pass', this)">◉</button></span>
+                        <button class="btn-success" style="width:auto; margin:0;" onclick="scanDevices()">Szukaj urządzeń</button>
+                        <button type="button" style="width:auto; margin:0;" onclick="startFullLocalScan()">Przeskanuj wszystkie sieci lokalne</button>
+                    </div>
+                    <div id="scan-status" class="settings-help"></div>
+                    <div class="discovery-results"><table class="devices-table"><thead><tr><th><button type="button" onclick="sortScanResults('name')">Nazwa<span id="scan-sort-name"></span></button></th><th><button type="button" onclick="sortScanResults('ip')">Adres<span id="scan-sort-ip"></span></button></th><th><button type="button" onclick="sortScanResults('type')">Typ<span id="scan-sort-type"></span></button></th><th><button type="button" onclick="sortScanResults('method')">Wykryto przez<span id="scan-sort-method"></span></button></th><th></th></tr></thead><tbody id="scan-results"><tr><td colspan="5" class="devices-result-empty">Uruchom wyszukiwanie, aby zobaczyć urządzenia w sieci.</td></tr></tbody></table></div>
+                </section>
+                <section class="panel">
+                    <h2>Dodaj ręcznie</h2>
+                    <p class="settings-help">Typ rozpoznajemy automatycznie. Rejestrator jest dodawany po udanym odczycie kanałów, kamera jako źródło RTSP.</p>
+                    <div class="form-group">
+                        <select id="existing-camera-select" onchange="loadCameraForEdit(this.value)"><option value="">Nowa kamera / urządzenie</option></select>
+                        <select id="device-type-choice"><option value="auto">Rozpoznaj typ automatycznie</option><option value="camera">Kamera</option><option value="nvr">Rejestrator</option></select>
+                        <input id="device-name" type="text" placeholder="Nazwa urządzenia" required>
+                        <input id="device-ip" type="text" placeholder="Adres IP" required>
+                        <input id="device-port" type="number" value="554" placeholder="Port">
+                        <input id="device-user" type="text" value="admin" placeholder="Użytkownik">
+                        <span class="password-field"><input id="device-pass" type="password" placeholder="Hasło"><button class="password-toggle" type="button" aria-label="Pokaż hasło" title="Pokaż hasło" onclick="togglePasswordVisibility('device-pass', this)">◉</button></span>
+                        <input id="device-rtsp-path" type="text" value="/" placeholder="Ścieżka RTSP (dla kamery)">
+                        <p class="settings-help" style="margin:0;">Przy edycji wpisz hasło ponownie — jest celowo ukryte i przed zapisem sprawdzimy rzeczywisty strumień RTSP.</p>
+                        <button id="save-device-button" class="btn-success" onclick="addManualDevice()">Rozpoznaj i zapisz urządzenie</button>
+                    </div>
+                </section>
+            </div>
+        </div>
+
         <div id="view-settings">
             <div class="settings-content">
                 <h2>Ustawienia</h2>
@@ -592,9 +680,39 @@
                             </div>
                             <p id="download-format-note" class="settings-help"></p>
                             <p class="settings-help">Wyższa jakość zajmuje więcej miejsca. Zmiana jakości może wydłużyć przygotowanie pliku. Eksport obecnie zawiera obraz bez dźwięku.</p>
+                            <label class="settings-checkbox" for="download-anonymize"><input id="download-anonymize" type="checkbox">Anonimowość — zasłoń wykryte twarze w pobieranym nagraniu</label>
+                            <p class="settings-help">Twarze są wykrywane i zakrywane czarną maską na serwerze, przed wysłaniem pliku do przeglądarki. Opcja wymaga ponownego zakodowania nagrania i może wydłużyć eksport.</p>
                         </fieldset>
                         <div id="download-settings-status" role="status" aria-live="polite"></div>
                         <div id="download-browser-warning" class="settings-warning" hidden></div>
+                    </div>
+                </details>
+                <details class="settings-group" style="margin-top:16px;">
+                    <summary>Synchronizacja czasu urządzeń</summary>
+                    <div class="settings-group-body">
+                        <p class="settings-help">Kamery są aktualizowane przez ONVIF. Rejestratory bez potwierdzonej komendy zapisu pozostaną widoczne w raporcie, zamiast zostać pominięte.</p>
+                        <div class="settings-fields">
+                            <label>Źródło czasu<select id="time-sync-source" onchange="toggleTimeSyncSource()"><option value="container">Serwer / kontener aplikacji</option><option value="ntp">Wskazany serwer NTP</option><option value="manual">Ręcznie ustawiona data</option></select></label>
+                            <label id="time-sync-ntp-row">Serwer NTP<input id="time-sync-ntp" placeholder="pool.ntp.org"></label>
+                            <label id="time-sync-manual-row" hidden>Data i godzina<input id="time-sync-manual" type="datetime-local"></label>
+                            <label>Interwał (min)<input id="time-sync-interval" type="number" min="1" max="1440" value="10"></label>
+                        </div>
+                        <label class="settings-checkbox"><input id="time-sync-enabled" type="checkbox" checked> Automatycznie aktualizuj czas</label>
+                        <div class="settings-fields">
+                            <label>Zakres<select id="time-sync-target-mode" onchange="renderTimeSyncTargets()"><option value="all">Wszystkie dołączone urządzenia</option><option value="category">Wybrana kategoria</option><option value="devices">Wybrane urządzenia</option></select></label>
+                            <label id="time-sync-category-row" hidden>Kategoria<select id="time-sync-category" onchange="renderTimeSyncTargets()"></select></label>
+                        </div>
+                        <div id="time-sync-devices" class="settings-help" hidden></div>
+                        <div style="margin-top:12px;"><button type="button" onclick="saveTimeSyncSettings()">Zapisz harmonogram</button> <button type="button" class="btn-success" onclick="runTimeSyncNow()">Aktualizuj datę w wybranych urządzeniach</button></div>
+                        <div id="time-sync-status" class="settings-help" role="status" style="margin-top:10px;"></div>
+                    </div>
+                </details>
+                <details class="settings-group" style="margin-top:16px;">
+                    <summary>Kategorie urządzeń</summary>
+                    <div class="settings-group-body">
+                        <p class="settings-help">Kategorie porządkują lewy panel. „Wszystkie urządzenia” jest stała — można tylko zmienić jej nazwę lub ją ukryć.</p>
+                        <div class="form-group" style="flex-direction:row;"><input id="new-category-name" placeholder="Nazwa nowej kategorii"><button onclick="createCategory()">Dodaj kategorię</button></div>
+                        <div id="category-settings-list" style="margin-top:12px;"></div>
                     </div>
                 </details>
             </div>
@@ -612,10 +730,51 @@
     </div>
 </div>
 
+<div id="device-config-modal" class="modal-backdrop" hidden role="dialog" aria-modal="true" aria-labelledby="device-config-title">
+    <form class="config-modal" onsubmit="saveDeviceConfig(event)">
+        <h2 id="device-config-title">Konfiguracja urządzenia</h2>
+        <p id="device-config-type" class="settings-help"></p>
+        <label>Nazwa<input id="config-name" required></label>
+        <label>Adres IP<input id="config-ip" required></label>
+        <label>Port<input id="config-port" type="number" min="1" max="65535" required></label>
+        <label>Użytkownik<input id="config-user" required></label>
+        <label id="config-device-type-row">Typ urządzenia<select id="config-device-type"></select></label>
+        <label>Hasło<span class="password-field"><input id="config-pass" type="password" placeholder="Pozostaw puste, aby nie zmieniać"><button class="password-toggle" type="button" aria-label="Pokaż hasło" title="Pokaż hasło" onclick="togglePasswordVisibility('config-pass', this)">◉</button></span></label>
+        <label id="config-rtsp-row">Ścieżka RTSP<input id="config-rtsp-path"></label>
+        <details class="settings-group" open><summary>Czas urządzenia</summary><div class="settings-group-body"><div id="device-time-status" class="settings-help">Odczytuj czas bezpośrednio z urządzenia.</div><button type="button" onclick="readDeviceTime()">Sprawdź czas</button> <button type="button" onclick="syncDeviceTime()">Ustaw czas z aplikacji</button></div></details>
+        <div id="device-config-status" class="settings-help" role="status"></div>
+        <div class="config-modal-actions"><button type="button" onclick="closeDeviceConfig()">Anuluj</button><button class="btn-success" style="width:auto; margin:0;" type="submit">Sprawdź i zapisz</button></div>
+    </form>
+</div>
+
+<div id="full-scan-modal" class="modal-backdrop" hidden role="dialog" aria-modal="true" aria-labelledby="full-scan-title">
+    <div class="config-modal">
+        <h2 id="full-scan-title">Pełne skanowanie sieci lokalnych</h2>
+        <p id="full-scan-progress" class="settings-help" role="status">Przygotowywanie skanowania…</p>
+        <progress id="full-scan-progress-bar" value="0" max="1" style="width:100%;"></progress>
+        <p id="full-scan-network-list" class="settings-help" style="max-height:110px; overflow:auto;"></p>
+        <p id="full-scan-found" class="settings-help"></p>
+        <div id="full-scan-add-row" class="form-group" style="flex-direction:row; margin:8px 0;"><input id="full-scan-add-network" placeholder="Dodaj sieć, np. 172.16.0.0/18"><button type="button" onclick="addFullScanNetwork()">Dodaj</button></div>
+        <div id="full-scan-selector" style="max-height:300px; overflow:auto; border:1px solid #444; border-radius:4px;"></div>
+        <p class="settings-help">Skanowane są wyłącznie prywatne podsieci dostępne przez lokalne trasy. Możesz bezpiecznie anulować operację.</p>
+        <div class="config-modal-actions"><button id="full-scan-cancel" type="button" onclick="cancelFullLocalScan()">Anuluj</button><button id="full-scan-start" class="btn-success" type="button" onclick="beginFullLocalScan()">Rozpocznij skanowanie</button></div>
+    </div>
+</div>
+
 <script>
     let dvrDatabase = [];
+    let deviceDatabase = [];
+    let deviceCategories = [];
+    let timeSyncSelectedKeys = new Set();
+    let fullScanTimer = null;
+    let scanResultsData = [];
+    let scanSort = { column: 'ip', direction: 'asc' };
+    let editingCameraId = null;
+    let configuringDevice = null;
     let currentGridCount = 4;
     const enabledDvrIds = new Set();     // ID włączonych kontrolerów z lewego panelu
+    const enabledCameraIds = new Set();
+    let deviceSelectionStorageKey = null;
     const activePeerConnections = {};    // cellIndex -> RTCPeerConnection
     const cellStreamQuality = {};        // cellIndex -> 2 (SD) lub 1 (HQ)
     const cellLiveRetryTimers = {};
@@ -646,37 +805,192 @@
         calSelectedDay = today.getDate();
 
         setGrid(4);
-        await refreshDvrList(true);
+        initTabDragging();
+        await initializeDeviceSelection();
+        await refreshDvrList(false);
+        await loadTimeSyncSettings();
         await refreshChannelStatus();
         window.setInterval(refreshChannelStatus, 60000);
     };
 
     // Przełączanie głównych zakładek bez resetowania strumieni WebRTC
     function switchMainTab(tabName) {
-        if (!['live', 'recordings', 'settings'].includes(tabName)) return;
-        for (const name of ['live', 'recordings', 'settings']) {
+        if (!['live', 'recordings', 'downloads', 'devices', 'settings'].includes(tabName)) return;
+        for (const name of ['live', 'recordings', 'downloads', 'devices', 'settings']) {
             document.getElementById(`tab-btn-${name}`).classList.toggle('active', name === tabName);
             document.getElementById(`view-${name}`).style.display = name === tabName
                 ? (name === 'live' ? 'grid' : name === 'recordings' ? 'flex' : 'block') : 'none';
         }
         if (tabName === 'recordings') updateRecCameraSelect();
+        if (tabName === 'downloads') window.refreshDownloadJobs?.();
+    }
+
+    function initTabDragging() {
+        const nav = document.querySelector('.tabs-nav');
+        let dragged = null;
+        nav.querySelectorAll('.tab-btn').forEach(tab => {
+            tab.addEventListener('dragstart', event => { dragged = tab; tab.classList.add('dragging'); event.dataTransfer.effectAllowed = 'move'; });
+            tab.addEventListener('dragend', () => { tab.classList.remove('dragging'); dragged = null; });
+            tab.addEventListener('dragover', event => {
+                event.preventDefault();
+                if (!dragged || dragged === tab) return;
+                const box = tab.getBoundingClientRect();
+                nav.insertBefore(dragged, event.clientX < box.left + box.width / 2 ? tab : tab.nextSibling);
+            });
+        });
+    }
+
+    function togglePasswordVisibility(inputId, button) {
+        const input = document.getElementById(inputId);
+        if (!input) return;
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        button.textContent = showing ? '◉' : '◉̸';
+        button.title = showing ? 'Pokaż hasło' : 'Ukryj hasło';
+        button.setAttribute('aria-label', button.title);
+    }
+
+    async function initializeDeviceSelection() {
+        let identity = 'anonymous';
+        try {
+            const response = await fetch('/api/session', { cache: 'no-store' });
+            const { user } = response.ok ? await response.json() : {};
+            if (user?.provider && user?.subject) identity = `${user.provider}:${user.subject}`;
+        } catch (_) {}
+        deviceSelectionStorageKey = `nvr.device-selection.v1.${identity}`;
+        try {
+            const saved = JSON.parse(localStorage.getItem(deviceSelectionStorageKey) || 'null');
+            if (!saved) return;
+            (saved.nvrs || []).forEach(id => enabledDvrIds.add(Number(id)));
+            (saved.cameras || []).forEach(id => enabledCameraIds.add(Number(id)));
+        } catch (_) {
+            // Selection is optional; an invalid browser value means no selection.
+        }
+    }
+
+    function persistDeviceSelection() {
+        if (!deviceSelectionStorageKey) return;
+        try {
+            localStorage.setItem(deviceSelectionStorageKey, JSON.stringify({
+                nvrs: [...enabledDvrIds], cameras: [...enabledCameraIds]
+            }));
+        } catch (_) {}
     }
 
     function downloadFormatLabel() {
         return (window.nvrDownloadSettings?.format || 'avi').toUpperCase();
     }
 
-    async function refreshDvrList(enableAllOnInit = false) {
+    async function refreshDvrList() {
         const response = await fetch('/api/dvrs');
         dvrDatabase = await response.json();
+        const devicesResponse = await fetch('/api/devices');
+        const deviceData = await devicesResponse.json();
+        deviceDatabase = deviceData.devices;
+        deviceCategories = deviceData.categories;
 
-        if (enableAllOnInit) {
-            dvrDatabase.forEach(dvr => enabledDvrIds.add(dvr.id));
-        }
+        const knownNvrs = new Set(dvrDatabase.map(dvr => dvr.id));
+        const knownCameras = new Set(deviceDatabase.filter(device => device.type === 'camera').map(camera => camera.id));
+        [...enabledDvrIds].forEach(id => { if (!knownNvrs.has(id)) enabledDvrIds.delete(id); });
+        [...enabledCameraIds].forEach(id => { if (!knownCameras.has(id)) enabledCameraIds.delete(id); });
 
         renderNvrSidebar();
         updateChannelSelectors();
         updateRecCameraSelect();
+        renderCategorySettings();
+        renderCameraEditor();
+        renderTimeSyncCategoryOptions();
+        persistDeviceSelection();
+    }
+
+    function renderTimeSyncCategoryOptions() {
+        const select = document.getElementById('time-sync-category');
+        if (!select) return;
+        const previous = select.value;
+        select.innerHTML = deviceCategories.filter(category => !category.hidden).map(category => `<option value="${category.id}">${category.name}</option>`).join('');
+        if ([...select.options].some(option => option.value === previous)) select.value = previous;
+    }
+
+    function toggleTimeSyncSource() {
+        const source = document.getElementById('time-sync-source').value;
+        document.getElementById('time-sync-ntp-row').hidden = source !== 'ntp';
+        document.getElementById('time-sync-manual-row').hidden = source !== 'manual';
+    }
+
+    function renderTimeSyncTargets() {
+        const mode = document.getElementById('time-sync-target-mode').value;
+        const categoryRow = document.getElementById('time-sync-category-row');
+        const list = document.getElementById('time-sync-devices');
+        categoryRow.hidden = mode !== 'category';
+        list.hidden = mode !== 'devices';
+        if (mode !== 'devices') return;
+        if (!deviceDatabase.length) { list.textContent = 'Brak dołączonych urządzeń.'; return; }
+        list.innerHTML = deviceDatabase.map(device => {
+            const key = `${device.type}:${device.id}`;
+            return `<label class="settings-checkbox"><input type="checkbox" value="${key}" ${timeSyncSelectedKeys.has(key) ? 'checked' : ''} onchange="toggleTimeSyncTarget(this)"> ${device.name} (${device.ip}) — ${device.type === 'camera' ? 'kamera' : 'rejestrator'}</label>`;
+        }).join('');
+    }
+
+    function toggleTimeSyncTarget(input) {
+        if (input.checked) timeSyncSelectedKeys.add(input.value);
+        else timeSyncSelectedKeys.delete(input.value);
+    }
+
+    async function loadTimeSyncSettings() {
+        try {
+            const response = await fetch('/api/time-sync/settings');
+            if (!response.ok) return;
+            const settings = await response.json();
+            document.getElementById('time-sync-source').value = settings.source;
+            document.getElementById('time-sync-ntp').value = settings.ntp_server || '';
+            if (settings.manual_time) {
+                const manual = new Date(settings.manual_time);
+                const pad = value => String(value).padStart(2, '0');
+                document.getElementById('time-sync-manual').value = `${manual.getFullYear()}-${pad(manual.getMonth() + 1)}-${pad(manual.getDate())}T${pad(manual.getHours())}:${pad(manual.getMinutes())}`;
+            } else document.getElementById('time-sync-manual').value = '';
+            document.getElementById('time-sync-interval').value = settings.interval_minutes;
+            document.getElementById('time-sync-enabled').checked = settings.enabled;
+            timeSyncSelectedKeys = new Set(settings.target_keys || []);
+            document.getElementById('time-sync-target-mode').value = timeSyncSelectedKeys.size ? 'devices' : 'all';
+            toggleTimeSyncSource(); renderTimeSyncTargets();
+        } catch (_) {}
+    }
+
+    function timeSyncTargetKeys() {
+        const mode = document.getElementById('time-sync-target-mode').value;
+        if (mode === 'all') return [];
+        if (mode === 'devices') return [...timeSyncSelectedKeys];
+        const categoryId = Number(document.getElementById('time-sync-category').value);
+        const category = deviceCategories.find(item => item.id === categoryId);
+        return category?.system ? [] : (category?.device_keys || []);
+    }
+
+    async function saveTimeSyncSettings() {
+        const status = document.getElementById('time-sync-status');
+        const payload = { source: document.getElementById('time-sync-source').value,
+            ntp_server: document.getElementById('time-sync-ntp').value.trim(),
+            manual_time: (() => { const value = document.getElementById('time-sync-manual').value; return value ? new Date(value).toISOString() : ''; })(),
+            interval_minutes: Number(document.getElementById('time-sync-interval').value),
+            enabled: document.getElementById('time-sync-enabled').checked, target_keys: timeSyncTargetKeys() };
+        status.textContent = 'Zapisywanie…';
+        const response = await fetch('/api/time-sync/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { status.textContent = body.detail || 'Nie udało się zapisać ustawień.'; return; }
+        timeSyncSelectedKeys = new Set(body.target_keys || []);
+        status.textContent = 'Harmonogram zapisany.';
+    }
+
+    async function runTimeSyncNow() {
+        const status = document.getElementById('time-sync-status');
+        await saveTimeSyncSettings();
+        if (status.textContent !== 'Harmonogram zapisany.') return;
+        status.textContent = 'Synchronizacja trwa…';
+        const response = await fetch('/api/time-sync/run', {method:'POST'});
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { status.textContent = body.detail || 'Synchronizacja nie powiodła się.'; return; }
+        const tally = body.results.reduce((acc, result) => { acc[result.status] = (acc[result.status] || 0) + 1; return acc; }, {});
+        const details = body.results.filter(result => result.status !== 'ok').map(result => `${result.name}: ${result.detail}`).join(' ');
+        status.textContent = `Zakończono: ${tally.ok || 0} zaktualizowano, ${tally.unsupported || 0} rejestratorów bez zapisu, ${tally.error || 0} błędów.${details ? ' ' + details : ''}`;
     }
 
     async function refreshChannelStatus() {
@@ -699,45 +1013,115 @@
 
     function renderNvrSidebar() {
         const listEl = document.getElementById('nvr-list');
-        if (!dvrDatabase.length) {
-            listEl.innerHTML = '<div style="color: #888; font-size: 13px;">Brak zapisanych rejestratorów.</div>';
+        if (!deviceDatabase.length) {
+            listEl.innerHTML = '<div style="color: #888; font-size: 13px;">Brak zapisanych urządzeń. Dodaj je w zakładce „Urządzenia”.</div>';
             return;
         }
 
         listEl.innerHTML = '';
-        dvrDatabase.forEach(dvr => {
-            const isChecked = enabledDvrIds.has(dvr.id);
-            const chCount = dvr.channels ? dvr.channels.length : 0;
-
-            const item = document.createElement('div');
-            item.className = `nvr-item ${isChecked ? 'active' : ''}`;
-            item.onclick = (e) => {
-                if (e.target.tagName !== 'INPUT') {
-                    toggleNvrSelection(dvr.id);
-                }
-            };
-
-            item.innerHTML = `
-                <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleNvrSelection(${dvr.id})">
-                <div class="nvr-info">
-                    <span class="nvr-title">${dvr.name}</span>
-                    <span class="nvr-meta">${dvr.ip} • ${chCount} kam.</span>
-                </div>
-            `;
-            listEl.appendChild(item);
+        deviceCategories.filter(category => !category.hidden).forEach(category => {
+            const groupDevices = category.system ? deviceDatabase : deviceDatabase.filter(device => category.device_keys.includes(`${device.type}:${device.id}`));
+            const selectedCount = groupDevices.filter(device => device.type === 'nvr' ? enabledDvrIds.has(device.id) : enabledCameraIds.has(device.id)).length;
+            const group = document.createElement('details');
+            group.className = 'device-category'; group.open = true;
+            group.innerHTML = `<summary>${category.name}<span class="device-category-actions"><input type="checkbox" ${groupDevices.length && selectedCount === groupDevices.length ? 'checked' : ''} title="Wybierz tylko urządzenia z tej kategorii" aria-label="Wybierz tylko urządzenia z kategorii" onclick="event.stopPropagation()" onchange="event.stopPropagation(); toggleCategorySelection(${category.id}, this.checked)"> ${selectedCount}/${groupDevices.length}</span></summary><div class="nvr-list"></div>`;
+            const groupList = group.querySelector('.nvr-list');
+            groupDevices.forEach(device => {
+                const isChecked = device.type === 'nvr' ? enabledDvrIds.has(device.id) : enabledCameraIds.has(device.id);
+                const chCount = device.channels_count || 1;
+                const item = document.createElement('div');
+                item.className = `nvr-item ${isChecked ? 'active' : ''}`;
+                item.onclick = (e) => { if (!e.target.closest('input, button')) toggleDeviceSelection(device.type, device.id); };
+                item.innerHTML = `<input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleDeviceSelection('${device.type}', ${device.id})"><div class="nvr-info"><span class="nvr-title">${device.name}</span><span class="nvr-meta">${device.ip}:${device.port} · ${chCount} ${device.type === 'nvr' ? 'kan.' : 'kamera'}</span><span class="device-type">${device.type === 'nvr' ? 'Rejestrator' : 'Kamera'}</span></div><button class="device-menu" title="Konfiguracja ${device.name}" aria-label="Konfiguracja ${device.name}" onclick="openDeviceConfig('${device.type}', ${device.id})">⋯</button>`;
+                groupList.appendChild(item);
+            });
+            listEl.appendChild(group);
         });
     }
 
     function toggleNvrSelection(dvrId) {
-        if (enabledDvrIds.has(dvrId)) {
-            enabledDvrIds.delete(dvrId);
-        } else {
-            enabledDvrIds.add(dvrId);
+        toggleDeviceSelection('nvr', dvrId);
+    }
+    async function openDeviceConfig(type, id) {
+        const response = await fetch(`/api/devices/${type}/${id}/config`);
+        if (!response.ok) { const error = await response.json(); return alert(error.detail || 'Nie udało się pobrać konfiguracji.'); }
+        const data = await response.json();
+        configuringDevice = data;
+        document.getElementById('device-config-title').textContent = `Konfiguracja: ${data.name}`;
+        document.getElementById('device-config-type').textContent = data.type === 'nvr' ? 'Rejestrator — przy zapisie odświeżymy listę kanałów.' : 'Kamera — przy zapisie sprawdzimy połączenie RTSP.';
+        document.getElementById('config-name').value = data.name;
+        document.getElementById('config-ip').value = data.ip;
+        document.getElementById('config-port').value = data.port;
+        document.getElementById('config-user').value = data.user;
+        const typeSelect = document.getElementById('config-device-type');
+        typeSelect.innerHTML = data.type === 'nvr'
+            ? '<option value="nvr">Rejestrator</option><option value="camera">Kamera</option>'
+            : '<option value="camera">Kamera</option>';
+        typeSelect.value = data.type;
+        document.getElementById('config-pass').value = '';
+        document.getElementById('config-rtsp-path').value = data.rtsp_path || '';
+        document.getElementById('config-rtsp-row').hidden = data.type !== 'camera';
+        document.getElementById('device-config-status').textContent = '';
+        document.getElementById('device-config-modal').hidden = false;
+    }
+    function closeDeviceConfig() {
+        document.getElementById('device-config-modal').hidden = true;
+        configuringDevice = null;
+    }
+    async function readDeviceTime() {
+        if (!configuringDevice) return;
+        const status = document.getElementById('device-time-status'); status.textContent = 'Odczytywanie…';
+        const response = await fetch(`/api/devices/${configuringDevice.type}/${configuringDevice.id}/time`);
+        const body = await response.json();
+        status.textContent = response.ok ? `${body.source}: ${JSON.stringify(body.time)}` : (body.detail || 'Nie udało się odczytać czasu.');
+    }
+    async function syncDeviceTime() {
+        if (!configuringDevice) return;
+        const status = document.getElementById('device-time-status'); status.textContent = 'Ustawianie czasu…';
+        const response = await fetch(`/api/devices/${configuringDevice.type}/${configuringDevice.id}/time/sync`, {method:'POST'});
+        const body = await response.json();
+        status.textContent = response.ok ? `Zaktualizowano: ${JSON.stringify(body.time)}` : (body.detail || 'Nie udało się ustawić czasu.');
+    }
+    async function saveDeviceConfig(event) {
+        event.preventDefault();
+        if (!configuringDevice) return;
+        const status = document.getElementById('device-config-status');
+        const payload = { name: document.getElementById('config-name').value.trim(), ip: document.getElementById('config-ip').value.trim(), port: Number(document.getElementById('config-port').value), user: document.getElementById('config-user').value.trim(), password: document.getElementById('config-pass').value };
+        if (configuringDevice.type === 'camera') payload.rtsp_path = document.getElementById('config-rtsp-path').value.trim() || '/';
+        if (configuringDevice.type === 'nvr' && document.getElementById('config-device-type').value === 'camera') {
+            if (!confirm('Przenieść urządzenie do kamer? Lista kanałów tego błędnie zapisanego rejestratora zostanie usunięta.')) return;
+            payload.rtsp_path = document.getElementById('config-rtsp-path').value.trim() || '/';
+            const converted = await fetch(`/api/devices/nvr/${configuringDevice.id}/convert-to-camera`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+            if (!converted.ok) { const error = await converted.json(); status.textContent = error.detail || 'Nie udało się zmienić typu urządzenia.'; return; }
+            closeDeviceConfig(); await refreshDvrList(false); await refreshChannelStatus(); return;
         }
+        status.textContent = 'Sprawdzanie połączenia i zapisywanie…';
+        const url = configuringDevice.type === 'nvr' ? `/api/dvrs/${configuringDevice.id}` : `/api/cameras/${configuringDevice.id}`;
+        const response = await fetch(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+        if (!response.ok) { const error = await response.json(); status.textContent = error.detail || 'Nie udało się zapisać konfiguracji.'; return; }
+        closeDeviceConfig();
+        await refreshDvrList(false);
+        await refreshChannelStatus();
+    }
+    function toggleDeviceSelection(type, id) {
+        const set = type === 'nvr' ? enabledDvrIds : enabledCameraIds;
+        if (set.has(id)) {
+            set.delete(id);
+        } else {
+            set.add(id);
+        }
+        persistDeviceSelection();
         renderNvrSidebar();
         // Aktualizujemy wyłącznie listy wyboru w kafelkach – NIE resetujemy aktywnych strumieni!
         updateChannelSelectors();
         updateRecCameraSelect();
+    }
+    function toggleCategorySelection(categoryId, checked) {
+        const category = deviceCategories.find(item => item.id === categoryId);
+        const groupDevices = category?.system ? deviceDatabase : deviceDatabase.filter(device => category?.device_keys.includes(`${device.type}:${device.id}`));
+        groupDevices.forEach(device => (device.type === 'nvr' ? enabledDvrIds : enabledCameraIds)[checked ? 'add' : 'delete'](device.id));
+        persistDeviceSelection();
+        renderNvrSidebar(); updateChannelSelectors(); updateRecCameraSelect();
     }
 
     async function addDVR() {
@@ -768,13 +1152,261 @@
         if (saveRes.ok) {
             const data = await saveRes.json();
             document.getElementById('nvr-pass').value = '';
-            enabledDvrIds.add(data.dvr_id);
             await refreshDvrList(false);
             alert(`Połączenie udane. Zapisano rejestrator oraz pobrano ${data.channels_count} kanałów!`);
         } else {
             const err = await saveRes.json();
             alert(`Błąd zapisu: ${err.detail}`);
         }
+    }
+
+    async function scanDevices() {
+        const status = document.getElementById('scan-status');
+        const targets = document.getElementById('scan-targets').value.trim();
+        const user = document.getElementById('scan-user').value.trim();
+        const password = document.getElementById('scan-pass').value;
+        status.textContent = 'Wyszukiwanie urządzeń…';
+        const response = await fetch('/api/devices/scan', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({targets, user, password}) });
+        const body = await response.json();
+        if (!response.ok) { status.textContent = body.detail || 'Nie udało się wykryć urządzeń.'; return; }
+        status.textContent = `${body.method}: znaleziono ${body.devices.length} urządzeń.`;
+        renderScanResults(body.devices);
+    }
+
+    function renderScanResults(devices) {
+        scanResultsData = devices;
+        renderSortedScanResults();
+    }
+
+    function sortScanResults(column) {
+        scanSort = scanSort.column === column
+            ? {column, direction: scanSort.direction === 'asc' ? 'desc' : 'asc'}
+            : {column, direction: 'asc'};
+        renderSortedScanResults();
+    }
+
+    function renderSortedScanResults() {
+        const results = document.getElementById('scan-results');
+        for (const column of ['name', 'ip', 'type', 'method']) {
+            document.getElementById(`scan-sort-${column}`).textContent = scanSort.column === column ? (scanSort.direction === 'asc' ? ' ↑' : ' ↓') : '';
+        }
+        const sorted = [...scanResultsData].sort((left, right) => {
+            let a = left[scanSort.column] || '', b = right[scanSort.column] || '';
+            if (scanSort.column === 'ip') {
+                a = a.split('.').map(part => Number(part).toString().padStart(3, '0')).join('.');
+                b = b.split('.').map(part => Number(part).toString().padStart(3, '0')).join('.');
+            }
+            const comparison = String(a).localeCompare(String(b), 'pl', {numeric: true, sensitivity: 'base'});
+            return scanSort.direction === 'asc' ? comparison : -comparison;
+        });
+        results.innerHTML = sorted.length ? '' : '<tr><td colspan="5" class="devices-result-empty">Nie znaleziono urządzeń.</td></tr>';
+        sorted.forEach(device => {
+            const row = document.createElement('tr');
+            const typeLabel = device.type === 'nvr' ? `Rejestrator${device.vendor ? ` (${device.vendor})` : ''}${device.channels_count ? ` · ${device.channels_count} kan.` : ''}` : `Kamera${device.vendor ? ` (${device.vendor})` : ''}`;
+            row.innerHTML = `<td>${device.name}</td><td>${device.ip}:${device.port}</td><td>${typeLabel}</td><td>${device.method}</td><td><button onclick='fillDetectedDevice(${JSON.stringify(device)})'>Dodaj</button></td>`;
+            results.appendChild(row);
+        });
+    }
+
+    async function startFullLocalScan() {
+        const modal = document.getElementById('full-scan-modal');
+        const progress = document.getElementById('full-scan-progress');
+        const networks = document.getElementById('full-scan-network-list');
+        const selector = document.getElementById('full-scan-selector');
+        modal.hidden = false; progress.textContent = 'Pobieranie możliwych sieci…'; networks.textContent = ''; selector.hidden = false; selector.innerHTML = ''; document.getElementById('full-scan-add-row').hidden = false;
+        document.getElementById('full-scan-start').hidden = false;
+        const response = await fetch('/api/devices/full-scan/candidates');
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.networks?.length) { progress.textContent = body.detail || 'Brak podstawy do wyznaczenia lokalnych sieci.'; return; }
+        progress.textContent = `Wybierz podsieci do skanowania (${body.networks.length} możliwych).`;
+        renderFullScanCandidates(body.networks);
+    }
+
+    function renderFullScanCandidates(networks) {
+        const rows = networks.map(network => `<tr><td><input type="checkbox" value="${network.cidr}" ${network.enabled ? 'checked' : ''} aria-label="Skanuj ${network.cidr}"></td><td><code>${network.cidr}</code></td><td>${network.known ? 'Wykryta / skonfigurowana' : 'Prywatny zakres możliwy do skanowania'}</td><td><button class="network-remove" type="button" onclick="removeFullScanNetwork('${network.cidr}')" title="Usuń z listy">Usuń</button></td></tr>`).join('');
+        document.getElementById('full-scan-selector').innerHTML = `<table class="network-selection-table"><thead><tr><th>Skanuj</th><th>Sieć</th><th>Źródło</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="devices-result-empty">Brak sieci na liście.</td></tr>'}</tbody></table>`;
+    }
+
+    async function addFullScanNetwork() {
+        const input = document.getElementById('full-scan-add-network');
+        const value = input.value.trim(); if (!value) return;
+        const response = await fetch('/api/devices/full-scan/candidates', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({networks:[value]})});
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { document.getElementById('full-scan-progress').textContent = body.detail || 'Nieprawidłowa sieć.'; return; }
+        input.value = ''; renderFullScanCandidates(body.networks);
+    }
+
+    async function removeFullScanNetwork(cidr) {
+        const response = await fetch('/api/devices/full-scan/candidates', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({networks:[cidr]})});
+        const body = await response.json().catch(() => ({}));
+        if (response.ok) renderFullScanCandidates(body.networks);
+    }
+
+    async function beginFullLocalScan() {
+        const progress = document.getElementById('full-scan-progress');
+        const bar = document.getElementById('full-scan-progress-bar');
+        const networks = [...document.querySelectorAll('#full-scan-selector input:checked')].map(input => input.value);
+        if (!networks.length) { progress.textContent = 'Wybierz co najmniej jedną podsieć.'; return; }
+        document.getElementById('full-scan-start').hidden = true;
+        document.getElementById('full-scan-selector').hidden = true;
+        document.getElementById('full-scan-add-row').hidden = true;
+        bar.value = 0; bar.max = 1;
+        progress.textContent = 'Przygotowywanie skanowania…';
+        const response = await fetch('/api/devices/full-scan/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user: document.getElementById('scan-user').value.trim(), password: document.getElementById('scan-pass').value, networks})});
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) { progress.textContent = body.detail || 'Nie udało się uruchomić skanowania.'; document.getElementById('full-scan-start').hidden = false; return; }
+        progress.textContent = `Przygotowano ${body.networks.length} sieci do skanowania.`;
+        document.getElementById('full-scan-network-list').textContent = `Kolejka: ${body.networks.join(', ')}.`;
+        if (fullScanTimer) clearInterval(fullScanTimer);
+        fullScanTimer = setInterval(pollFullLocalScan, 700);
+        pollFullLocalScan();
+    }
+
+    async function pollFullLocalScan() {
+        const response = await fetch('/api/devices/full-scan/status', {cache:'no-store'});
+        if (!response.ok) return;
+        const state = await response.json();
+        const progress = document.getElementById('full-scan-progress');
+        const bar = document.getElementById('full-scan-progress-bar');
+        const networks = document.getElementById('full-scan-network-list');
+        const found = document.getElementById('full-scan-found');
+        bar.max = Math.max(state.total || 1, 1); bar.value = Math.min(state.completed || 0, bar.max);
+        const queue = state.networks || [];
+        networks.textContent = queue.length ? `Sieci (${queue.length}): ${queue.map((network, index) => `${index + 1 === state.network_index ? '▶ ' : ''}${index + 1}. ${network}`).join(' · ')}` : '';
+        found.textContent = `Wykryte urządzenia: ${(state.devices || []).length}.`;
+        progress.textContent = state.running ? `Skanowanie sieci ${state.network_index}/${queue.length}: ${state.network} — ${state.completed}/${state.total} adresów.` : (state.cancelled ? 'Skanowanie anulowane.' : state.error || `Skanowanie zakończone: znaleziono ${state.devices.length} urządzeń.`);
+        if (state.running) return;
+        clearInterval(fullScanTimer); fullScanTimer = null;
+        if (!state.cancelled && !state.error) renderScanResults(state.devices || []);
+        document.getElementById('full-scan-selector').hidden = true;
+        window.setTimeout(() => { document.getElementById('full-scan-modal').hidden = true; }, 700);
+    }
+
+    async function cancelFullLocalScan() {
+        if (!fullScanTimer) { document.getElementById('full-scan-modal').hidden = true; return; }
+        await fetch('/api/devices/full-scan/cancel', {method:'POST'});
+        document.getElementById('full-scan-progress').textContent = 'Anulowanie…';
+    }
+    function fillDetectedDevice(device) {
+        document.getElementById('device-name').value = device.name;
+        document.getElementById('device-ip').value = device.ip;
+        document.getElementById('device-port').value = device.port;
+        document.getElementById('device-rtsp-path').value = device.rtsp_path || '/';
+    }
+    async function addManualDevice() {
+        const name = document.getElementById('device-name').value.trim();
+        const ip = document.getElementById('device-ip').value.trim();
+        const port = Number(document.getElementById('device-port').value);
+        const user = document.getElementById('device-user').value.trim();
+        const password = document.getElementById('device-pass').value;
+        const rtsp_path = document.getElementById('device-rtsp-path').value.trim() || '/';
+        if (!name || !ip || !port) return alert('Podaj nazwę, adres IP oraz port.');
+        const requestedType = document.getElementById('device-type-choice').value;
+        let detectedType = requestedType === 'auto' ? 'camera' : requestedType;
+        if (requestedType === 'auto') try {
+            const scan = await fetch('/api/devices/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({targets:ip})});
+            const data = await scan.json();
+            if (scan.ok && data.devices[0]) detectedType = data.devices[0].type;
+        } catch (_) {}
+        // Port 34567 is shared by many XM cameras and NVRs. With supplied
+        // credentials the recorder protocol is the authoritative test.
+        if (!editingCameraId && requestedType === 'auto' && detectedType !== 'nvr') {
+            try {
+                const probe = await fetch('/api/dvrs/test', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, ip, port, user, password})});
+                if (probe.ok && (await probe.json()).channels_count > 1) detectedType = 'nvr';
+            } catch (_) {}
+        }
+        if (detectedType === 'nvr') {
+            const payload = {name, ip, port, user, password};
+            const test = await fetch('/api/dvrs/test', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+            if (!test.ok) { const e = await test.json(); return alert(`Nie udało się potwierdzić rejestratora: ${e.detail}`); }
+            const saved = await fetch('/api/dvrs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+            if (!saved.ok) { const e = await saved.json(); return alert(e.detail); }
+            await saved.json();
+        } else {
+            const payload = {name, ip, port, user, password, rtsp_path};
+            const url = editingCameraId ? `/api/cameras/${editingCameraId}` : '/api/cameras';
+            const saved = await fetch(url, {method: editingCameraId ? 'PUT' : 'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+            if (!saved.ok) { const e = await saved.json(); return alert(`Nie udało się ${editingCameraId ? 'zaktualizować' : 'dodać'} kamery: ${e.detail}`); }
+            await saved.json();
+        }
+        document.getElementById('device-pass').value = '';
+        await refreshDvrList(false);
+        alert(`${editingCameraId ? 'Zaktualizowano' : 'Dodano'} ${detectedType === 'nvr' ? 'rejestrator' : 'kamerę'}.`);
+    }
+    function renderCameraEditor() {
+        const select = document.getElementById('existing-camera-select'); if (!select) return;
+        const selected = String(editingCameraId || '');
+        const cameras = deviceDatabase.filter(device => device.type === 'camera');
+        select.innerHTML = '<option value="">Nowa kamera / urządzenie</option>' + cameras.map(camera => `<option value="${camera.id}" ${selected === String(camera.id) ? 'selected' : ''}>Edytuj: ${camera.name} (${camera.ip})</option>`).join('');
+    }
+    async function loadCameraForEdit(value) {
+        editingCameraId = value ? Number(value) : null;
+        const button = document.getElementById('save-device-button');
+        if (!editingCameraId) { button.textContent = 'Rozpoznaj i zapisz urządzenie'; return; }
+        const response = await fetch('/api/devices'); const data = await response.json();
+        const camera = data.devices.find(device => device.type === 'camera' && device.id === editingCameraId);
+        if (!camera) return;
+        document.getElementById('device-name').value = camera.name;
+        document.getElementById('device-ip').value = camera.ip;
+        document.getElementById('device-port').value = camera.port;
+        document.getElementById('device-user').value = 'admin';
+        document.getElementById('device-pass').value = '';
+        document.getElementById('device-rtsp-path').value = '/mode=real&idc=1&ids=2';
+        button.textContent = 'Sprawdź i zapisz zmiany kamery';
+    }
+    async function createCategory() {
+        const input = document.getElementById('new-category-name'); const name = input.value.trim();
+        if (!name) return;
+        const response = await fetch('/api/device-categories', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+        if (!response.ok) { const e = await response.json(); return alert(e.detail); }
+        input.value = ''; await refreshDvrList(false);
+    }
+    function renderCategorySettings() {
+        const list = document.getElementById('category-settings-list'); if (!list) return;
+        list.innerHTML = '';
+        deviceCategories.forEach(category => {
+            const row = document.createElement('div'); row.className = 'panel'; row.style.marginTop = '8px'; row.style.padding = '10px';
+            const note = category.system ? '<span class="settings-help">Stała kategoria zawierająca każde urządzenie.</span>' : '<span class="settings-help">Kategoria jest folderem — urządzenie może należeć tylko do jednej kategorii.</span>';
+            row.innerHTML = `<div class="form-group" style="flex-direction:row; align-items:center;"><input id="category-name-${category.id}" value="${category.name.replace(/"/g, '&quot;')}" style="flex:1;"><label class="settings-help"><input id="category-hidden-${category.id}" type="checkbox" ${category.hidden ? 'checked' : ''}> Ukryj</label><button onclick="saveCategory(${category.id})">Zapisz</button>${category.system ? '' : `<button onclick="deleteCategory(${category.id})">Usuń</button>`}</div><div>${note}</div>`;
+            list.appendChild(row);
+        });
+        if (deviceDatabase.length) {
+            const assignment = document.createElement('div'); assignment.className = 'panel'; assignment.style.marginTop = '14px'; assignment.style.padding = '10px';
+            const customCategories = deviceCategories.filter(category => !category.system);
+            const categoryForDevice = new Map();
+            customCategories.forEach(category => category.device_keys.forEach(key => categoryForDevice.set(key, category.id)));
+            assignment.innerHTML = '<strong style="font-size:14px;">Przypisanie urządzeń do kategorii</strong><p class="settings-help">Wybierz jeden folder dla urządzenia; nie jest to zestaw etykiet.</p>';
+            deviceDatabase.forEach(device => {
+                const key = `${device.type}:${device.id}`;
+                const select = document.createElement('select'); select.dataset.deviceKey = key; select.style.marginLeft = '8px';
+                select.innerHTML = '<option value="">Bez kategorii</option>' + customCategories.map(category => `<option value="${category.id}" ${categoryForDevice.get(key) === category.id ? 'selected' : ''}>${category.name}</option>`).join('');
+                const row = document.createElement('label'); row.style.cssText = 'display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:7px; font-size:13px;';
+                const label = document.createElement('span'); label.textContent = `${device.name} (${device.type === 'nvr' ? 'rejestrator' : 'kamera'})`;
+                row.append(label, select); assignment.appendChild(row);
+            });
+            const save = document.createElement('button'); save.textContent = 'Zapisz przypisania'; save.style.marginTop = '12px'; save.onclick = saveDeviceAssignments; assignment.appendChild(save);
+            list.appendChild(assignment);
+        }
+    }
+    async function saveCategory(id) {
+        const name = document.getElementById(`category-name-${id}`).value.trim(); const hidden = document.getElementById(`category-hidden-${id}`).checked;
+        const response = await fetch(`/api/device-categories/${id}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, hidden})});
+        if (!response.ok) { const e = await response.json(); return alert(e.detail); }
+        await refreshDvrList(false);
+    }
+    async function saveDeviceAssignments() {
+        const assignments = {};
+        document.querySelectorAll('select[data-device-key]').forEach(select => assignments[select.dataset.deviceKey] = select.value ? Number(select.value) : null);
+        const response = await fetch('/api/device-category-assignments', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({assignments})});
+        if (!response.ok) { const e = await response.json(); return alert(e.detail || 'Nie udało się zapisać przypisań.'); }
+        await refreshDvrList(false);
+    }
+    async function deleteCategory(id) {
+        if (!confirm('Usunąć tę kategorię? Urządzenia pozostaną zapisane.')) return;
+        const response = await fetch(`/api/device-categories/${id}`, {method:'DELETE'});
+        if (!response.ok) { const e = await response.json(); return alert(e.detail); }
+        await refreshDvrList(false);
     }
 
     /* ===============================================================
@@ -792,8 +1424,8 @@
             if (!dvr.channels || !dvr.channels.length) return;
             html += `<optgroup label="Rejestrator: ${dvr.name} (${dvr.ip})">`;
             dvr.channels.forEach(ch => {
-                const val = `${dvr.id}:${ch.channel_number}`;
-                const state = channelConnectionState.get(val);
+                const val = `nvr:${dvr.id}:${ch.channel_number}`;
+                const state = channelConnectionState.get(`${dvr.id}:${ch.channel_number}`);
                 const status = state === false ? ' [offline — stan NVR]' : '';
                 const label = `[${dvr.name}] Kanał ${ch.channel_number}: ${ch.name}${status}`;
                 const isSelected = currentSel && currentSel.key === val;
@@ -802,6 +1434,16 @@
             });
             html += `</optgroup>`;
         });
+        const activeCameras = deviceDatabase.filter(device => device.type === 'camera' && enabledCameraIds.has(device.id));
+        if (activeCameras.length) html += '<optgroup label="Samodzielne kamery">';
+        activeCameras.forEach(camera => {
+            const val = `camera:${camera.id}`;
+            const label = `[Kamera] ${camera.name} (${camera.ip})`;
+            const isSelected = currentSel && currentSel.key === val;
+            if (isSelected) currentIncluded = true;
+            html += `<option value="${val}" ${isSelected ? 'selected' : ''}>${label}</option>`;
+        });
+        if (activeCameras.length) html += '</optgroup>';
 
         // Jeśli w tym kafelku gra kamera z kontrolera, który został właśnie odznaczony na liście po lewej,
         // zachowujemy tę opcję jako wybraną, aby nie przerywać odtwarzania wideo!
@@ -924,9 +1566,10 @@
             return;
         }
 
-        const [dvrIdStr, channelStr] = compositeVal.split(':');
-        const dvrId = parseInt(dvrIdStr);
-        const channel = parseInt(channelStr);
+        const parts = compositeVal.split(':');
+        const type = parts[0] === 'camera' ? 'camera' : 'nvr';
+        const dvrId = parseInt(type === 'camera' ? parts[1] : parts[1]);
+        const channel = type === 'camera' ? 1 : parseInt(parts[2]);
         const stream = cellStreamQuality[cellIndex] || 2;
 
         if (!dvrId || !channel) {
@@ -937,7 +1580,7 @@
 
         container.innerHTML = `<video id="video-${cellIndex}" autoplay muted playsinline controls></video>`;
         if (statusEl) statusEl.textContent = stream === 1 ? 'Łączenie HQ...' : 'Łączenie...';
-        await startWebRTC(cellIndex, dvrId, channel, stream);
+        await startWebRTC(cellIndex, type, dvrId, channel, stream);
     }
 
     function waitForIceGathering(pc, timeoutMs = 400) {
@@ -960,7 +1603,7 @@
         });
     }
 
-    function retryLiveCell(cellIndex, video, dvrId, channel, stream) {
+    function retryLiveCell(cellIndex, video, type, dvrId, channel, stream) {
         if (document.getElementById(`video-${cellIndex}`) !== video) return;
         if (cellLiveRetryTimers[cellIndex]) return;
         const statusEl = document.getElementById(`status-${cellIndex}`);
@@ -977,8 +1620,9 @@
             if (statusEl) statusEl.textContent = '🟡 HQ niedostępne — przełączanie na Live SD…';
             cellLiveRetryTimers[cellIndex] = setTimeout(() => {
                 delete cellLiveRetryTimers[cellIndex];
-                if (cellActiveSelection[cellIndex]?.key === `${dvrId}:${channel}`) {
-                    loadChannelToCell(cellIndex, `${dvrId}:${channel}`);
+                const key = type === 'camera' ? `camera:${dvrId}` : `nvr:${dvrId}:${channel}`;
+                if (cellActiveSelection[cellIndex]?.key === key) {
+                    loadChannelToCell(cellIndex, key);
                 }
             }, 500);
             return;
@@ -988,13 +1632,14 @@
         cellLiveRetryTimers[cellIndex] = setTimeout(() => {
             delete cellLiveRetryTimers[cellIndex];
             if (document.getElementById(`video-${cellIndex}`) !== video) return;
-            if (cellActiveSelection[cellIndex]?.key !== `${dvrId}:${channel}`) return;
+            const key = type === 'camera' ? `camera:${dvrId}` : `nvr:${dvrId}:${channel}`;
+            if (cellActiveSelection[cellIndex]?.key !== key) return;
             if ((cellStreamQuality[cellIndex] || 2) !== stream) return;
-            loadChannelToCell(cellIndex, `${dvrId}:${channel}`);
+            loadChannelToCell(cellIndex, key);
         }, waitSeconds * 1000);
     }
 
-    function fallbackToMp4Stream(cellIndex, dvrId, channel, stream, expectedVideo) {
+    function fallbackToMp4Stream(cellIndex, type, dvrId, channel, stream, expectedVideo) {
         const video = document.getElementById(`video-${cellIndex}`);
         if (!video || video !== expectedVideo || video.dataset.fallback === 'true') return;
         video.dataset.fallback = 'true';
@@ -1002,11 +1647,11 @@
         const statusEl = document.getElementById(`status-${cellIndex}`);
         if (statusEl) statusEl.textContent = stream === 1 ? 'Łączenie HQ...' : 'Łączenie...';
         video.srcObject = null;
-        video.src = `/api/stream.mp4?dvr_id=${dvrId}&channel=${channel}&stream=${stream}`;
+        video.src = type === 'camera' ? `/api/cameras/${dvrId}/stream.mp4?stream=${stream}` : `/api/stream.mp4?dvr_id=${dvrId}&channel=${channel}&stream=${stream}`;
         video.play().catch(() => {});
     }
 
-    async function startWebRTC(cellIndex, dvrId, channel, stream = 2) {
+    async function startWebRTC(cellIndex, type, dvrId, channel, stream = 2) {
         const video = document.getElementById(`video-${cellIndex}`);
         const statusEl = document.getElementById(`status-${cellIndex}`);
         const pc = new RTCPeerConnection();
@@ -1020,7 +1665,7 @@
             usingFallback = true;
             clearTimeout(fallbackTimer);
             clearTimeout(disconnectTimer);
-            fallbackToMp4Stream(cellIndex, dvrId, channel, stream, video);
+            fallbackToMp4Stream(cellIndex, type, dvrId, channel, stream, video);
         };
         const fallbackTimer = setTimeout(() => {
             if (!receivedFrames && activePeerConnections[cellIndex] === pc) useFallback();
@@ -1040,9 +1685,9 @@
         video.onerror = () => {
             if (!isCurrent()) return;
             if (!usingFallback) useFallback();
-            else retryLiveCell(cellIndex, video, dvrId, channel, stream);
+            else retryLiveCell(cellIndex, video, type, dvrId, channel, stream);
         };
-        video.onended = () => retryLiveCell(cellIndex, video, dvrId, channel, stream);
+        video.onended = () => retryLiveCell(cellIndex, video, type, dvrId, channel, stream);
         pc.ontrack = event => {
             if (isCurrent() && !usingFallback && video.srcObject !== event.streams[0]) {
                 video.srcObject = event.streams[0];
@@ -1067,7 +1712,7 @@
             await pc.setLocalDescription(offer);
             await waitForIceGathering(pc, 400);
             if (!isCurrent() || usingFallback) return;
-            const res = await fetch('/api/webrtc', {
+            const res = await fetch(type === 'camera' ? `/api/cameras/${dvrId}/webrtc` : '/api/webrtc', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ dvr_id: dvrId, channel, sdp: pc.localDescription.sdp, stream })
             });
@@ -1403,7 +2048,7 @@
     }
 
 </script>
-<script type="module" src="/static/downloads.mjs?v=2"></script>
+<script type="module" src="/static/downloads.mjs?v=4"></script>
 <script>
     async function showSignedInUser() {
         const panel = document.getElementById('signed-in-user');

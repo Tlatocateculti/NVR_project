@@ -12,6 +12,9 @@ services:
       GOOGLE_CREDENTIALS_FILE: ${GOOGLE_CREDENTIALS_FILE:-}
       MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
       MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+      # Comma-separated LAN/VLAN CIDRs reachable through the host router.
+      # Needed in bridge mode because Docker cannot inspect host routing.
+      DISCOVERY_NETWORKS: ${DISCOVERY_NETWORKS:-}
     ports:
       - "8000:8000"
     volumes:

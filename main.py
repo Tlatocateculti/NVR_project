@@ -5,12 +5,18 @@ from starlette.middleware.sessions import SessionMiddleware
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Literal
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Event, Lock, Thread
+from queue import Queue, Empty
+from uuid import uuid4
+import asyncio
+import random
+import time as time_module
 import shutil
 import tempfile
 import logging
 import mimetypes
-from quii_archive import ArchiveError, Recording, save_video, convert_video
+import html
+from quii_archive import ArchiveError, Recording, save_video, convert_video, anonymize_faces
 from local_runtime import LocalRelay
 from live_proxy import open_mp4_proxy
 from auth import callback_url, oauth, settings as auth_settings
@@ -18,7 +24,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from dvrip import DVRIPCam
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
@@ -32,13 +38,20 @@ import struct
 import json
 import re
 import os
+import ipaddress
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 @asynccontextmanager
 async def app_lifespan(app):
     local_relay.start()
+    download_jobs.start()
+    scheduler = asyncio.create_task(time_sync_scheduler())
     try:
         yield
     finally:
+        scheduler.cancel()
+        download_jobs.stop()
         local_relay.stop()
 
 
@@ -57,6 +70,10 @@ GO2RTC_RTSP = os.environ.get(
 LIVE_STREAM_LOCK = Lock()
 LIVE_STREAM_SIGNATURES = {}
 STREAM_COLOR_NORMALIZATION: dict[str, bool] = {}
+DISCOVERY_JOB_LOCK = Lock()
+DISCOVERY_CANCEL = Event()
+DISCOVERY_JOB: dict = {"running": False, "cancelled": False, "network": "", "completed": 0,
+                       "total": 0, "devices": [], "error": "", "networks": [], "network_index": 0}
 
 os.makedirs("data", exist_ok=True)
 
@@ -92,11 +109,63 @@ class NVR(BaseModel):
     password: str
 
 
+class NVRUpdate(BaseModel):
+    name: str
+    ip: str
+    port: int
+    user: str
+    password: str = ""
+
+
 class WebRTCOffer(BaseModel):
     dvr_id: int
     channel: int
     sdp: str
     stream: int = 2  # 2 = Substream (zapasowy), 1 = Mainstream (HQ)
+
+
+class Camera(BaseModel):
+    name: str
+    ip: str
+    port: int = 554
+    user: str = "admin"
+    password: str = ""
+    rtsp_path: str = "/"
+    category_ids: list[int] = []
+
+
+class DeviceScanRequest(BaseModel):
+    targets: str = ""
+    user: str = ""
+    password: str = ""
+    networks: list[str] = []
+
+
+class DiscoveryNetworkSelection(BaseModel):
+    networks: list[str] = []
+
+
+class DeviceCategory(BaseModel):
+    name: str
+    hidden: bool = False
+
+
+class TimeSyncSettings(BaseModel):
+    source: Literal["container", "ntp", "manual"] = "container"
+    ntp_server: str = "pool.ntp.org"
+    manual_time: str = ""
+    interval_minutes: int = 10
+    target_keys: list[str] = []
+    enabled: bool = True
+    hidden: bool = False
+
+
+class CategoryMembers(BaseModel):
+    device_keys: list[str] = []
+
+
+class DeviceAssignments(BaseModel):
+    assignments: dict[str, int | None] = {}
 
 
 def tdk_aes_encrypt(password: str, user: str, nc: str) -> str:
@@ -296,6 +365,57 @@ def init_db():
                   channel_number INTEGER,
                   name TEXT,
                   FOREIGN KEY(dvr_id) REFERENCES dvrs(id) ON DELETE CASCADE)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS cameras
+                 (id INTEGER PRIMARY KEY, name TEXT NOT NULL, ip TEXT NOT NULL,
+                  port INTEGER NOT NULL DEFAULT 554, user TEXT, password TEXT,
+                  rtsp_path TEXT NOT NULL DEFAULT '/')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS device_categories
+                 (id INTEGER PRIMARY KEY, name TEXT NOT NULL, hidden INTEGER NOT NULL DEFAULT 0,
+                  system_key TEXT UNIQUE)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS device_category_items
+                 (category_id INTEGER NOT NULL, device_type TEXT NOT NULL,
+                  device_id INTEGER NOT NULL,
+                 PRIMARY KEY(category_id, device_type, device_id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS time_sync_settings
+                 (id INTEGER PRIMARY KEY CHECK (id = 1), source TEXT NOT NULL,
+                  ntp_server TEXT NOT NULL, manual_time TEXT NOT NULL,
+                  interval_minutes INTEGER NOT NULL, target_keys TEXT NOT NULL,
+                  enabled INTEGER NOT NULL, last_run_at REAL NOT NULL DEFAULT 0)''')
+    c.execute("INSERT OR IGNORE INTO time_sync_settings VALUES (1, 'container', 'pool.ntp.org', '', 10, '[]', 1, 0)")
+    c.execute('''CREATE TABLE IF NOT EXISTS discovery_networks
+                 (cidr TEXT PRIMARY KEY, first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+                  devices_seen INTEGER NOT NULL DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS discovery_scan_networks
+                 (cidr TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, hidden INTEGER NOT NULL DEFAULT 0,
+                 custom INTEGER NOT NULL DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS download_jobs
+                 (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, created_at REAL NOT NULL,
+                  started_at REAL, finished_at REAL, dvr_id INTEGER NOT NULL,
+                  dvr_name TEXT NOT NULL, channel INTEGER NOT NULL, camera_name TEXT NOT NULL,
+                  recording_date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+                  filename TEXT, output_format TEXT NOT NULL, quality TEXT NOT NULL,
+                  anonymized INTEGER NOT NULL, status TEXT NOT NULL, stage TEXT NOT NULL,
+                  progress REAL NOT NULL DEFAULT 0, result_path TEXT, result_name TEXT,
+                  error TEXT, duration_seconds REAL NOT NULL DEFAULT 0)''')
+    c.execute('''CREATE INDEX IF NOT EXISTS download_jobs_owner_created
+                 ON download_jobs(owner_id, created_at DESC)''')
+    try:
+        c.execute("ALTER TABLE discovery_scan_networks ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE discovery_scan_networks ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    # A category is a folder, not a tag: a device can belong to one custom
+    # category at most. Existing experimental rows are normalised on upgrade.
+    c.execute('''DELETE FROM device_category_items WHERE rowid NOT IN
+                 (SELECT MIN(rowid) FROM device_category_items GROUP BY device_type, device_id)''')
+    c.execute('''CREATE UNIQUE INDEX IF NOT EXISTS one_custom_category_per_device
+                 ON device_category_items(device_type, device_id)''')
+    # The system group is permanent. It is a virtual group, so it needs no rows
+    # in device_category_items and always contains every recorder and camera.
+    c.execute("INSERT OR IGNORE INTO device_categories (name, hidden, system_key) VALUES ('Wszystkie urządzenia', 0, 'all')")
     # Connection state is transient and must never be persisted as part of a
     # channel name. Remove labels written by older versions of the application.
     c.execute("UPDATE channels SET name = REPLACE(name, ' [offline]', '') WHERE name LIKE '% [offline]'")
@@ -400,6 +520,712 @@ def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
         urllib.request.urlopen(put_req, timeout=5.0).read()
         LIVE_STREAM_SIGNATURES[stream_name] = signature
     return stream_name
+
+
+def camera_rtsp_url(ip: str, port: int, user: str, password: str, path: str) -> str:
+    """Build a generic RTSP URL for an independently added camera."""
+    u_enc = urllib.parse.quote(user or "", safe="")
+    p_enc = urllib.parse.quote(password or "", safe="")
+    credentials = f"{u_enc}:{p_enc}@" if user or password else ""
+    normalized_path = path.strip() or "/"
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    return f"rtsp://{credentials}{ip}:{port}{normalized_path}#media=video"
+
+
+def camera_rtsp_path_for_stream(path: str, stream: int) -> str:
+    """Select the main profile for known Qualvision camera URLs.
+
+    Qualvision exposes its two live profiles at the same endpoint: ``ids=2``
+    is the substream and ``ids=1`` is the main (HQ) stream. Other vendors'
+    paths are left unchanged, so a manual RTSP path stays valid.
+    """
+    if stream != 1:
+        return path
+    return re.sub(r"([?&]ids=)2(?=(&|$))", r"\g<1>1", path, count=1)
+
+
+def vendor_from_http_fingerprint(value: str) -> str | None:
+    """Recognise common CCTV/network vendors from public HTTP metadata."""
+    fingerprint = value.lower()
+    for marker, vendor in (
+        ("hikvision", "Hikvision"),
+        ("dahua", "Dahua"),
+        ("ubiquiti", "Ubiquiti"),
+        ("kenik", "Kenik"),
+        ("qualvision", "Qualvision"),
+    ):
+        if marker in fingerprint:
+            return vendor
+    return None
+
+
+def http_device_vendor(ip: str) -> str | None:
+    """Identify a device from its public HTTP banner or landing page.
+
+    This works independently of ARP/MAC visibility, so Docker deployment does
+    not change the discovery result. HTTP 401 pages are useful too because
+    they commonly include the same vendor banner.
+    """
+    try:
+        with urllib.request.urlopen(f"http://{ip}/", timeout=3) as response:
+            fingerprint = response.headers.get("Server", "") + "\n" + response.read(32768).decode("utf-8", "ignore")
+    except urllib.error.HTTPError as exc:
+        fingerprint = exc.headers.get("Server", "")
+        try:
+            fingerprint += "\n" + exc.read(32768).decode("utf-8", "ignore")
+        except OSError:
+            pass
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    return vendor_from_http_fingerprint(fingerprint)
+
+
+def camera_vendor(ip: str) -> str | None:
+    """Backward-compatible vendor lookup used by camera RTSP detection."""
+    return http_device_vendor(ip)
+
+
+def detect_camera_rtsp_path(ip: str, current_path: str = "/") -> str:
+    """Choose a known vendor RTSP path only when the generic path was used."""
+    if current_path.strip() not in ("", "/"):
+        return current_path
+    if camera_vendor(ip) in {"Qualvision", "Kenik"}:
+        # Qualvision/TDK and Kenik use the same channel-style RTSP endpoint
+        # for an independent camera; channel 1 and substream are the safe default.
+        return "/mode=real&idc=1&ids=2"
+    return current_path
+
+
+def camera_connection_from_registered_nvr(ip: str) -> tuple[str, str, str] | None:
+    """Read the proven per-channel credentials from a saved NVR, if present.
+
+    Qualvision cameras are often connected to an NVR through QUVII/34567 while
+    exposing their direct live feed over RTSP/554. The channel configuration is
+    the authoritative source for that camera's account; it is never returned
+    from an API or logged.
+    """
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        recorders = conn.execute("SELECT ip, user, password FROM dvrs").fetchall()
+    finally:
+        conn.close()
+    for nvr_ip, nvr_user, nvr_password in recorders:
+        root = tdk_send_command(nvr_ip, nvr_user, nvr_password, "get.channelmanagement.config", timeout=5)
+        if root is None or root.findtext(".//error") != "0":
+            continue
+        for channel in root.findall(".//channel"):
+            config = channel.find("config")
+            if config is None or (config.findtext("ipaddress") or "").strip() != ip:
+                continue
+            user = (config.findtext("username") or "").strip()
+            password = config.findtext("password") or ""
+            if user:
+                return user, password, (config.findtext("protocol") or "").strip().lower()
+    return None
+
+
+def onvif_soap_request(url: str, user: str, password: str, action: str, body: str) -> ET.Element:
+    """Issue an authenticated ONVIF SOAP request without logging credentials."""
+    nonce = os.urandom(16)
+    created = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    digest = base64.b64encode(hashlib.sha1(nonce + created.encode() + password.encode()).digest()).decode()
+    security = (
+        '<wsse:Security s:mustUnderstand="1"><wsse:UsernameToken>'
+        f'<wsse:Username>{html.escape(user)}</wsse:Username>'
+        '<wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-username-token-profile-1.0#PasswordDigest">'
+        f'{digest}</wsse:Password><wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/'
+        'oasis-200401-wss-soap-message-security-1.0#Base64Binary">'
+        f'{base64.b64encode(nonce).decode()}</wsse:Nonce><wsu:Created>{created}</wsu:Created>'
+        '</wsse:UsernameToken></wsse:Security>'
+    )
+    envelope = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+        'xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" '
+        'xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">'
+        f'<s:Header>{security}</s:Header><s:Body>{body}</s:Body></s:Envelope>'
+    ).encode()
+    request = urllib.request.Request(url, data=envelope, method="POST", headers={
+        "Content-Type": "application/soap+xml; charset=utf-8",
+        "SOAPAction": action,
+    })
+    with urllib.request.urlopen(request, timeout=8) as response:
+        return ET.fromstring(response.read())
+
+
+def onvif_rtsp_connection(ip: str, user: str, password: str) -> tuple[int, str] | None:
+    """Resolve an independent camera's RTSP URI from its ONVIF media profile."""
+    device_url = f"http://{ip}/onvif/device_service"
+    capabilities = (
+        '<tds:GetCapabilities xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+        '<tds:Category>Media</tds:Category></tds:GetCapabilities>'
+    )
+    try:
+        root = onvif_soap_request(device_url, user, password,
+                                  "http://www.onvif.org/ver10/device/wsdl/GetCapabilities", capabilities)
+        media_url = next((node.text for node in root.iter() if node.tag.endswith("XAddr")
+                          and node.text and "media" in node.text.lower()), None)
+        if not media_url:
+            return None
+        profiles = onvif_soap_request(
+            media_url, user, password, "http://www.onvif.org/ver10/media/wsdl/GetProfiles",
+            '<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>')
+        token = next((node.attrib.get("token") for node in profiles.iter()
+                      if node.tag.endswith("Profiles") and node.attrib.get("token")), None)
+        if not token:
+            return None
+        stream_body = (
+            '<trt:GetStreamUri xmlns:trt="http://www.onvif.org/ver10/media/wsdl" '
+            'xmlns:tt="http://www.onvif.org/ver10/schema"><trt:StreamSetup>'
+            '<tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol>'
+            '</tt:Transport></trt:StreamSetup>'
+            f'<trt:ProfileToken>{html.escape(token)}</trt:ProfileToken></trt:GetStreamUri>'
+        )
+        stream = onvif_soap_request(media_url, user, password,
+                                    "http://www.onvif.org/ver10/media/wsdl/GetStreamUri", stream_body)
+        uri = next((node.text for node in stream.iter() if node.tag.endswith("Uri") and node.text), None)
+        if not uri:
+            return None
+        parsed = urllib.parse.urlsplit(uri)
+        if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
+            return None
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        return parsed.port or 554, path
+    except (urllib.error.URLError, urllib.error.HTTPError, ET.ParseError, TimeoutError, OSError):
+        return None
+
+
+def onvif_read_device_time(ip: str, user: str, password: str) -> dict[str, str]:
+    """Read an ONVIF camera clock without exposing credentials."""
+    root = onvif_soap_request(
+        f"http://{ip}/onvif/device_service", user, password,
+        "http://www.onvif.org/ver10/device/wsdl/GetSystemDateAndTime",
+        '<tds:GetSystemDateAndTime xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>',
+    )
+    allowed = {"Year", "Month", "Day", "Hour", "Minute", "Second", "DateTimeType", "TZ", "DaylightSavings"}
+    return {node.tag.split("}")[-1]: (node.text or "") for node in root.iter()
+            if node.tag.split("}")[-1] in allowed}
+
+
+def onvif_set_device_time(ip: str, user: str, password: str, value: datetime,
+                          timezone_name: str = "CET-1") -> dict[str, str]:
+    """Set an ONVIF camera clock from an aware UTC datetime and verify it."""
+    utc = value.astimezone(timezone.utc)
+    date_time = (
+        "<tt:Date><tt:Year>{}</tt:Year><tt:Month>{}</tt:Month><tt:Day>{}</tt:Day></tt:Date>"
+        "<tt:Time><tt:Hour>{}</tt:Hour><tt:Minute>{}</tt:Minute><tt:Second>{}</tt:Second></tt:Time>"
+    ).format(utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second)
+    body = (
+        '<tds:SetSystemDateAndTime xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
+        'xmlns:tt="http://www.onvif.org/ver10/schema">'
+        "<tds:DateTimeType>Manual</tds:DateTimeType><tds:DaylightSavings>false</tds:DaylightSavings>"
+        f"<tds:TimeZone><tt:TZ>{html.escape(timezone_name)}</tt:TZ></tds:TimeZone>"
+        f"<tds:UTCDateTime>{date_time}</tds:UTCDateTime></tds:SetSystemDateAndTime>"
+    )
+    onvif_soap_request(f"http://{ip}/onvif/device_service", user, password,
+                       "http://www.onvif.org/ver10/device/wsdl/SetSystemDateAndTime", body)
+    return onvif_read_device_time(ip, user, password)
+
+
+def resolve_camera_connection(camera: Camera) -> None:
+    """Use the NVR metadata as a fallback, never over explicit camera credentials."""
+    inherited = camera_connection_from_registered_nvr(camera.ip)
+    if inherited:
+        inherited_user, inherited_password, protocol = inherited
+        # The credentials stored in an NVR channel are not necessarily the
+        # camera's RTSP credentials (and some recorders mask/rewrite them).
+        # A password supplied while adding/editing a camera is authoritative.
+        if not camera.password:
+            camera.user, camera.password = inherited_user, inherited_password
+        elif not camera.user:
+            camera.user = inherited_user
+        if protocol == "quvii":
+            camera.rtsp_path = "/mode=real&idc=1&ids=2"
+        elif camera.rtsp_path.strip() in ("", "/"):
+            resolved = onvif_rtsp_connection(camera.ip, camera.user, camera.password)
+            if resolved:
+                camera.port, camera.rtsp_path = resolved
+    if camera.rtsp_path.strip() in ("", "/"):
+        camera.rtsp_path = detect_camera_rtsp_path(camera.ip, camera.rtsp_path)
+
+
+def verify_camera_rtsp(camera: Camera) -> None:
+    """Verify authentication and a video track without exposing credentials."""
+    ffprobe = os.environ.get("FFPROBE_BIN") or shutil.which("ffprobe")
+    if not ffprobe:
+        return
+    url = camera_rtsp_url(camera.ip, camera.port, camera.user, camera.password, camera.rtsp_path)
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-rtsp_transport", "tcp", "-timeout", "5000000",
+             "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1", url],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=400, detail="Nie udało się połączyć ze strumieniem RTSP kamery.") from exc
+    if result.returncode != 0 or "codec_type=video" not in result.stdout:
+        detail = result.stderr.lower()
+        if "401" in detail or "unauthorized" in detail or "authorization" in detail:
+            message = "Kamera odrzuciła logowanie RTSP — sprawdź użytkownika i hasło urządzenia."
+        elif "404" in detail or "not found" in detail or "describe" in detail:
+            message = "Kamera nie zaakceptowała ścieżki RTSP. Sprawdź profil/ścieżkę producenta."
+        else:
+            message = "Kamera nie zwróciła strumienia wideo RTSP."
+        raise HTTPException(status_code=400, detail=message)
+
+
+def ensure_camera_stream(camera_id: int, stream: int = 2) -> str:
+    try:
+        local_relay.ensure()
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Przekaźnik obrazu jest uruchamiany. Spróbuj ponownie za chwilę.") from exc
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        row = conn.execute("SELECT ip, port, user, password, rtsp_path FROM cameras WHERE id = ?", (camera_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono kamery w bazie.")
+    ip, port, user, password, path = row
+    camera = Camera(name="", ip=ip, port=port, user=user or "", password=password or "", rtsp_path=path)
+    resolve_camera_connection(camera)
+    if (camera.port, camera.user, camera.password, camera.rtsp_path) != (port, user, password, path):
+        conn = sqlite3.connect("data/dvrs.db")
+        try:
+            conn.execute("UPDATE cameras SET port = ?, user = ?, password = ?, rtsp_path = ? WHERE id = ?",
+                         (camera.port, camera.user, camera.password, camera.rtsp_path, camera_id))
+            conn.commit()
+        finally:
+            conn.close()
+    stream_id = stream if stream in (1, 2) else 2
+    profile_path = camera_rtsp_path_for_stream(camera.rtsp_path, stream_id)
+    rtsp = camera_rtsp_url(camera.ip, camera.port, camera.user, camera.password, profile_path)
+    name = f"camera_{camera_id}_s_{stream_id}"
+    params = [("name", name), ("src", rtsp)]
+    if stream_id == 1:
+        params.append(("src", f"ffmpeg:{rtsp}#video=h264#timeout=15"))
+    signature = hashlib.sha256(repr(params).encode("utf-8")).digest()
+    with LIVE_STREAM_LOCK:
+        if LIVE_STREAM_SIGNATURES.get(name) == signature:
+            try:
+                with urllib.request.urlopen(f"{GO2RTC_API}/api/streams", timeout=5.0) as response:
+                    if name in json.load(response):
+                        return name
+            except Exception:
+                pass
+        query = urllib.parse.urlencode(params)
+        request = urllib.request.Request(f"{GO2RTC_API}/api/streams?{query}", method="PUT")
+        try:
+            urllib.request.urlopen(request, timeout=12).read()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Nie udało się zarejestrować strumienia kamery: {exc}") from exc
+        LIVE_STREAM_SIGNATURES[name] = signature
+    return name
+
+
+def classify_host(ip: str, ports: set[int], ws_types: str = "") -> str:
+    lower_types = ws_types.lower()
+    if "networkvideorecorder" in lower_types or "network_video_recorder" in lower_types:
+        return "nvr"
+    if "networkvideotransmitter" in lower_types or "camera" in lower_types:
+        return "camera"
+    # Passive network fingerprinting. Cameras commonly expose RTSP/554 plus
+    # their media service on 49152 (and often 5801); recorders in this estate
+    # typically expose HTTP(S) + RTSP but not 49152. Authenticated channel
+    # inventory below remains the final authority for an ambiguous host.
+    if 49152 in ports:
+        return "camera"
+    # Native ports alone are not definitive: XM/Kenik cameras use 34567 and
+    # Dahua cameras commonly expose 37777 too. A media service on 49152 is a
+    # strong camera marker; otherwise the recorder pattern is RTSP + its
+    # legacy media port without that camera service.
+    if 554 in ports and 5801 in ports and 34567 in ports:
+        return "nvr"
+    if 554 in ports and (443 in ports or 8000 in ports):
+        return "nvr"
+    if 554 in ports:
+        return "camera"
+    return "camera"
+
+
+def parse_scan_targets(value: str) -> list[str]:
+    """Accept IPs, CIDR networks and inclusive IPv4 ranges, with a safe cap."""
+    result: list[str] = []
+    for raw in re.split(r"[,;\s]+", value.strip()):
+        if not raw:
+            continue
+        if "-" in raw:
+            first, last = (ipaddress.ip_address(x.strip()) for x in raw.split("-", 1))
+            if first.version != 4 or last.version != 4 or int(last) < int(first):
+                raise ValueError(f"Nieprawidłowy zakres IP: {raw}")
+            hosts = [str(ipaddress.ip_address(n)) for n in range(int(first), int(last) + 1)]
+        else:
+            network = ipaddress.ip_network(raw, strict=False)
+            hosts = [str(host) for host in network.hosts()] if network.num_addresses > 1 else [str(network.network_address)]
+        result.extend(hosts)
+        if len(result) > 1024:
+            raise ValueError("Zakres wykrywania jest zbyt duży (maksymalnie 1024 adresy).")
+    return list(dict.fromkeys(result))
+
+
+def configured_discovery_networks() -> list[ipaddress.IPv4Network]:
+    """Read administrator-defined routed discovery scopes from the environment.
+
+    A Docker bridge cannot see the host's routing table. These CIDRs make
+    additional LAN/VLAN routes explicit without requiring an address range in
+    every scan request (for example ``192.168.49.0/24,10.20.0.0/24``).
+    """
+    networks: list[ipaddress.IPv4Network] = []
+    for raw in re.split(r"[,;\s]+", os.environ.get("DISCOVERY_NETWORKS", "").strip()):
+        if not raw:
+            continue
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+            if network.version == 4 and network.is_private:
+                networks.append(network)
+        except ValueError:
+            logging.warning("Pomijam nieprawidłową podsieć DISCOVERY_NETWORKS: %s", raw)
+    return networks
+
+
+def targets_from_networks(networks: list[ipaddress.IPv4Network], limit: int = 1024) -> list[str]:
+    targets: list[str] = []
+    for network in networks:
+        for host in network.hosts():
+            targets.append(str(host))
+            if len(targets) >= limit:
+                return list(dict.fromkeys(targets))
+    return list(dict.fromkeys(targets))
+
+
+def routed_ipv4_networks() -> list[ipaddress.IPv4Network]:
+    """Private, directly routed IPv4 networks visible to this process."""
+    networks = configured_discovery_networks()
+    try:
+        with open("/proc/net/route", encoding="ascii") as routes:
+            next(routes, None)
+            for line in routes:
+                fields = line.split()
+                if len(fields) < 8 or fields[1] == "00000000":
+                    continue
+                if fields[0].startswith(("docker", "br-", "veth")):
+                    continue
+                destination = socket.inet_ntoa(struct.pack("<L", int(fields[1], 16)))
+                mask = socket.inet_ntoa(struct.pack("<L", int(fields[7], 16)))
+                network = ipaddress.ip_network(f"{destination}/{mask}", strict=False)
+                if network.version == 4 and network.is_private:
+                    networks.append(network)
+    except OSError:
+        pass
+    return list(dict.fromkeys(networks))
+
+
+def routed_ipv4_targets(limit: int = 1024) -> list[str]:
+    """Return a bounded host sample from directly reachable IPv4 routes.
+
+    Explicit user ranges remain authoritative. This is only the no-input
+    fallback after ONVIF multicast and intentionally excludes the default
+    route, which is not a network discovery scope.
+    """
+    return targets_from_networks(routed_ipv4_networks(), limit)
+
+
+def known_device_network_targets(limit: int = 1024) -> list[str]:
+    """Expand private /24 networks containing saved devices.
+
+    The web app may run in Docker, where ``/proc/net/route`` only exposes the
+    Docker bridge. Saved recorder/camera addresses are therefore the most
+    reliable discovery scope for the user's actual LAN.
+    """
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        ips = [row[0] for row in conn.execute("SELECT ip FROM dvrs UNION SELECT ip FROM cameras")]
+    finally:
+        conn.close()
+    networks = configured_discovery_networks()
+    for value in ips:
+        try:
+            address = ipaddress.ip_address(value)
+            if address.version != 4 or not address.is_private:
+                continue
+            network = ipaddress.ip_network(f"{address}/24", strict=False)
+        except ValueError:
+            continue
+        networks.append(network)
+    return targets_from_networks(list(dict.fromkeys(networks)), limit)
+
+
+def known_device_networks() -> list[ipaddress.IPv4Network]:
+    """Return /24s inferred from saved devices, without expanding them yet."""
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        ips = [row[0] for row in conn.execute("SELECT ip FROM dvrs UNION SELECT ip FROM cameras")]
+    finally:
+        conn.close()
+    networks = []
+    for value in ips:
+        try:
+            address = ipaddress.ip_address(value)
+            if address.version == 4 and address.is_private:
+                networks.append(ipaddress.ip_network(f"{address}/24", strict=False))
+        except ValueError:
+            continue
+    return list(dict.fromkeys(networks))
+
+
+def saved_discovery_networks() -> list[ipaddress.IPv4Network]:
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        rows = conn.execute("SELECT cidr FROM discovery_networks").fetchall()
+    finally:
+        conn.close()
+    result = []
+    for (value,) in rows:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+            if network.version == 4 and network.is_private:
+                result.append(network)
+        except ValueError:
+            continue
+    return result
+
+
+def remember_discovery_network(ip: str) -> None:
+    try:
+        network = ipaddress.ip_network(f"{ip}/24", strict=False)
+    except ValueError:
+        return
+    now = time_module.time()
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        conn.execute("""INSERT INTO discovery_networks (cidr, first_seen_at, last_seen_at, devices_seen)
+                        VALUES (?, ?, ?, 1)
+                        ON CONFLICT(cidr) DO UPDATE SET last_seen_at = excluded.last_seen_at,
+                            devices_seen = discovery_networks.devices_seen + 1""",
+                     (str(network), now, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def scan_host(ip: str, user: str = "", password: str = "", known_nvr: bool = False) -> dict | None:
+    open_ports: set[int] = set()
+    # Include native management services, not only RTSP. Some recorders have
+    # RTSP disabled, yet expose Hikvision/Uniview 8000, Dahua 37777/37778 or
+    # XM/Kenik 34567.
+    ports_to_test = (80, 443, 554, 5800, 5801, 8000, 8080, 8081, 8443, 8899, 9000,
+                     34567, 37777, 37778, 49152)
+    for port in ports_to_test:
+        try:
+            with socket.create_connection((ip, port), timeout=0.35):
+                open_ports.add(port)
+        except OSError:
+            pass
+    if not open_ports:
+        return None
+    # HTTP/HTTPS alone identifies far too many unrelated devices (routers,
+    # printers, switches). Keep discovery results limited to hosts exposing a
+    # CCTV/ONVIF/native-video service; HTTP is used only as a vendor hint.
+    cctv_ports = {554, 8899, 34567, 37777, 37778, 49152}
+    if not open_ports.intersection(cctv_ports):
+        return None
+    kind = classify_host(ip, open_ports)
+    channels_count: int | None = None
+    # The XM NETIP service (34567) is shared by cameras and recorders, so it
+    # is not a type marker. A successful authenticated channel inventory is.
+    if known_nvr:
+        kind = "nvr"
+    elif user and 34567 in open_ports:
+        try:
+            channels_count = len(fetch_nvr_channels(NVR(name="", ip=ip, port=34567, user=user, password=password)))
+            kind = "nvr" if channels_count > 1 else "camera"
+        except (HTTPException, OSError):
+            pass
+    vendor = http_device_vendor(ip) if 80 in open_ports else None
+    rtsp_path = "/mode=real&idc=1&ids=2" if vendor in {"Qualvision", "Kenik"} else "/"
+    name_prefix = f"{('Rejestrator' if kind == 'nvr' else 'Kamera')} {vendor}" if vendor else ('Rejestrator' if kind == 'nvr' else 'Kamera')
+    return {"ip": ip, "type": kind, "name": f"{name_prefix} {ip}",
+            "port": 34567 if kind == "nvr" and 34567 in open_ports else (554 if 554 in open_ports else min(open_ports)),
+            "ports": sorted(open_ports), "channels_count": channels_count, "vendor": vendor,
+            "rtsp_path": rtsp_path, "method": "Skan IP"}
+
+
+def ws_discover() -> list[dict]:
+    """Best-effort ONVIF WS-Discovery (plug-and-play multicast)."""
+    message_id = f"uuid:{secrets.token_hex(16)}"
+    probe = f'''<?xml version="1.0" encoding="UTF-8"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://docs.oasis-open.org/ws-dd/ns/discovery"><e:Header><w:MessageID>{message_id}</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To><w:Action>http://docs.oasis-open.org/ws-dd/ns/discovery/Probe</w:Action></e:Header><e:Body><d:Probe/></e:Body></e:Envelope>'''.encode()
+    found: dict[str, dict] = {}
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.settimeout(1.2)
+        sock.sendto(probe, ("239.255.255.250", 3702))
+        while True:
+            try:
+                payload, _ = sock.recvfrom(65535)
+            except socket.timeout:
+                break
+            text = payload.decode("utf-8", errors="ignore")
+            locations = re.findall(r"<[^>]*:?(?:XAddrs|Scopes)[^>]*>(.*?)</", text, re.I | re.S)
+            urls = re.findall(r"https?://([^/:\s]+)", " ".join(locations))
+            types = " ".join(re.findall(r"<[^>]*:Types[^>]*>(.*?)</", text, re.I | re.S))
+            for ip in urls:
+                try:
+                    ipaddress.ip_address(ip)
+                except ValueError:
+                    continue
+                kind = classify_host(ip, set(), types)
+                found[ip] = {"ip": ip, "type": kind, "name": f"{'Rejestrator' if kind == 'nvr' else 'Kamera'} {ip}", "port": 554 if kind == "camera" else 34567, "ports": [], "method": "ONVIF Plug & Play"}
+    except OSError:
+        pass
+    finally:
+        try: sock.close()
+        except UnboundLocalError: pass
+    return list(found.values())
+
+
+def ssdp_discover() -> list[dict]:
+    """Discover UPnP devices through the actual SSDP M-SEARCH protocol."""
+    message = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        "HOST: 239.255.255.250:1900\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 2\r\n"
+        "ST: ssdp:all\r\n\r\n"
+    ).encode("ascii")
+    found: dict[str, dict] = {}
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(2.5)
+        sock.sendto(message, ("239.255.255.250", 1900))
+        while True:
+            try:
+                payload, sender = sock.recvfrom(65535)
+            except socket.timeout:
+                break
+            text = payload.decode("utf-8", errors="ignore")
+            headers = dict(line.split(":", 1) for line in text.splitlines()[1:] if ":" in line)
+            location = next((value.strip() for key, value in headers.items() if key.lower() == "location"), "")
+            host = urllib.parse.urlsplit(location).hostname or sender[0]
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                continue
+            found[host] = {"ip": host, "method": "UPnP/SSDP"}
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except UnboundLocalError:
+            pass
+    return list(found.values())
+
+
+def full_local_scan_worker(networks: list[ipaddress.IPv4Network], user: str, password: str) -> None:
+    found: dict[str, dict] = {}
+    try:
+        for network in networks:
+            with DISCOVERY_JOB_LOCK:
+                if DISCOVERY_CANCEL.is_set():
+                    DISCOVERY_JOB["cancelled"] = True
+                    break
+                DISCOVERY_JOB["network"] = str(network)
+                DISCOVERY_JOB["network_index"] = networks.index(network) + 1
+            hosts = (str(host) for host in network.hosts())
+            while not DISCOVERY_CANCEL.is_set():
+                batch = []
+                try:
+                    for _ in range(96):
+                        batch.append(next(hosts))
+                except StopIteration:
+                    pass
+                if not batch:
+                    break
+                with ThreadPoolExecutor(max_workers=48) as pool:
+                    futures = [pool.submit(scan_host, ip, user, password) for ip in batch]
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result:
+                            found[result["ip"]] = result
+                            remember_discovery_network(result["ip"])
+                            with DISCOVERY_JOB_LOCK:
+                                DISCOVERY_JOB["devices"] = sorted(found.values(), key=lambda item: item["ip"])
+                with DISCOVERY_JOB_LOCK:
+                    DISCOVERY_JOB["completed"] += len(batch)
+        with DISCOVERY_JOB_LOCK:
+            DISCOVERY_JOB["devices"] = sorted(found.values(), key=lambda item: item["ip"])
+    except Exception as exc:
+        logging.exception("Pełne skanowanie lokalnych sieci nie powiodło się")
+        with DISCOVERY_JOB_LOCK:
+            DISCOVERY_JOB["error"] = "Skanowanie zostało przerwane przez błąd."
+    finally:
+        with DISCOVERY_JOB_LOCK:
+            DISCOVERY_JOB["running"] = False
+
+
+def full_local_scan_networks() -> list[ipaddress.IPv4Network]:
+    """Use configured, known and previously confirmed reachable LANs."""
+    networks = [*configured_discovery_networks(), *known_device_networks(),
+                *saved_discovery_networks()]
+    return list(dict.fromkeys(network for network in networks if network.num_addresses > 2))
+
+
+def discovery_network_candidates() -> list[dict]:
+    """Build a compact, editable chooser covering all private IPv4 ranges."""
+    configured = {str(network) for network in configured_discovery_networks()}
+    known = {str(network) for network in [*known_device_networks(), *saved_discovery_networks()]}
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        preferences = {cidr: (bool(enabled), bool(hidden), bool(custom)) for cidr, enabled, hidden, custom in
+                       conn.execute("SELECT cidr, enabled, hidden, custom FROM discovery_scan_networks").fetchall()}
+    finally:
+        conn.close()
+    base = [ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+    candidates = {str(network): network for network in [*base, *configured_discovery_networks(),
+                  *known_device_networks(), *saved_discovery_networks()]}
+    for cidr, (_, _, custom) in preferences.items():
+        if not custom:
+            continue
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+            if network.version == 4 and network.is_private:
+                candidates[cidr] = network
+        except ValueError:
+            continue
+    return [{"cidr": cidr, "enabled": preferences.get(cidr, (cidr in configured or cidr in known, False, False))[0],
+             "known": cidr in configured or cidr in known}
+            for cidr, network in sorted(candidates.items(), key=lambda item: (int(item[1].network_address), item[1].prefixlen))
+            if not preferences.get(cidr, (False, False, False))[1]]
+
+
+def save_discovery_network_preferences(networks: list[str]) -> list[ipaddress.IPv4Network]:
+    selected: list[ipaddress.IPv4Network] = []
+    for value in networks:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+            if network.version != 4 or not network.is_private:
+                raise ValueError
+            selected.append(network)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Nieprawidłowa podsieć skanowania: {value}")
+    if len(selected) > 256:
+        raise HTTPException(status_code=422, detail="Można wybrać maksymalnie 256 podsieci.")
+    known_candidates = [item["cidr"] for item in discovery_network_candidates()]
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        conn.executemany("INSERT INTO discovery_scan_networks (cidr, enabled, hidden) VALUES (?, 0, 0) ON CONFLICT(cidr) DO UPDATE SET enabled = 0, hidden = 0",
+                         [(cidr,) for cidr in known_candidates])
+        conn.executemany("INSERT INTO discovery_scan_networks (cidr, enabled, hidden) VALUES (?, 1, 0) ON CONFLICT(cidr) DO UPDATE SET enabled = 1, hidden = 0",
+                         [(str(network),) for network in selected])
+        conn.commit()
+    finally:
+        conn.close()
+    return list(dict.fromkeys(selected))
 
 
 def stream_needs_color_normalization(stream_name: str) -> bool:
@@ -585,6 +1411,532 @@ async def add_dvr(nvr: NVR):
     return {"status": "success", "dvr_id": dvr_id, "channels_count": len(channels)}
 
 
+@app.get("/api/devices/{device_type}/{device_id}/config")
+def get_device_config(device_type: Literal["nvr", "camera"], device_id: int):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        if device_type == "nvr":
+            row = conn.execute("SELECT name, ip, port, user FROM dvrs WHERE id = ?", (device_id,)).fetchone()
+            fields = ["name", "ip", "port", "user"]
+        else:
+            row = conn.execute("SELECT name, ip, port, user, rtsp_path FROM cameras WHERE id = ?", (device_id,)).fetchone()
+            fields = ["name", "ip", "port", "user", "rtsp_path"]
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono urządzenia.")
+    return {"id": device_id, "type": device_type, **dict(zip(fields, row))}
+
+
+def device_time(device_type: Literal["nvr", "camera"], device_id: int) -> dict:
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        table = "cameras" if device_type == "camera" else "dvrs"
+        row = conn.execute(f"SELECT ip, port, user, password FROM {table} WHERE id = ?", (device_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono urządzenia.")
+    ip, port, user, password = row
+    try:
+        if device_type == "camera":
+            return {"source": "ONVIF", "time": onvif_read_device_time(ip, user, password)}
+        from tools.inspect_recorder_config import read_time
+        return {"source": "natywny protokół rejestratora", "time": read_time(ip, port, user, password)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Nie udało się odczytać czasu urządzenia.") from exc
+
+
+@app.get("/api/devices/{device_type}/{device_id}/time")
+def get_device_time(device_type: Literal["nvr", "camera"], device_id: int):
+    return device_time(device_type, device_id)
+
+
+@app.post("/api/devices/{device_type}/{device_id}/time/sync")
+def sync_device_time(device_type: Literal["nvr", "camera"], device_id: int):
+    if device_type != "camera":
+        raise HTTPException(status_code=501, detail="Zapis czasu rejestratora wymaga jeszcze potwierdzenia natywnej komendy urządzenia.")
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        row = conn.execute("SELECT ip, user, password FROM cameras WHERE id = ?", (device_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono kamery.")
+    ip, user, password = row
+    try:
+        return {"status": "ok", "source": "czas aplikacji", "time": onvif_set_device_time(ip, user, password, datetime.now(timezone.utc))}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Kamera nie przyjęła ustawienia czasu ONVIF.") from exc
+
+
+def load_time_sync_settings() -> dict:
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        row = conn.execute("""SELECT source, ntp_server, manual_time, interval_minutes,
+                              target_keys, enabled, last_run_at
+                           FROM time_sync_settings WHERE id = 1""").fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"source": "container", "ntp_server": "pool.ntp.org", "manual_time": "",
+                "interval_minutes": 10, "target_keys": [], "enabled": True, "last_run_at": 0}
+    try:
+        targets = json.loads(row[4])
+    except (TypeError, json.JSONDecodeError):
+        targets = []
+    return {"source": row[0], "ntp_server": row[1], "manual_time": row[2],
+            "interval_minutes": row[3], "target_keys": targets if isinstance(targets, list) else [],
+            "enabled": bool(row[5]), "last_run_at": row[6]}
+
+
+def resolve_time_source(settings: dict) -> datetime:
+    source = settings["source"]
+    if source == "container":
+        return datetime.now(timezone.utc)
+    if source == "manual":
+        value = settings["manual_time"].strip()
+        if not value:
+            raise ValueError("Podaj ręcznie ustawianą datę i godzinę.")
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            # The settings form expresses manual time in the operator's local time.
+            parsed = parsed.astimezone()
+        return parsed.astimezone(timezone.utc)
+    if source == "ntp":
+        server = settings["ntp_server"].strip()
+        if not server:
+            raise ValueError("Podaj adres serwera NTP.")
+        packet = b"\x1b" + 47 * b"\0"
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(4)
+            client.sendto(packet, (server, 123))
+            response, _ = client.recvfrom(48)
+        if len(response) < 48:
+            raise ValueError("Serwer NTP zwrócił niepełną odpowiedź.")
+        seconds = struct.unpack("!Q", response[40:48])[0] / 2 ** 32 - 2208988800
+        return datetime.fromtimestamp(seconds, timezone.utc)
+    raise ValueError("Nieznane źródło czasu.")
+
+
+def selected_time_sync_devices(target_keys: list[str]) -> list[tuple[str, int, str, str, int, str, str]]:
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        devices = [("nvr", *row) for row in conn.execute("SELECT id, name, ip, port, user, password FROM dvrs").fetchall()]
+        devices += [("camera", *row) for row in conn.execute("SELECT id, name, ip, port, user, password FROM cameras").fetchall()]
+    finally:
+        conn.close()
+    requested = set(target_keys)
+    return [device for device in devices if not requested or f"{device[0]}:{device[1]}" in requested]
+
+
+def run_time_sync(settings: dict | None = None) -> dict:
+    settings = settings or load_time_sync_settings()
+    source_time = resolve_time_source(settings)
+    devices = selected_time_sync_devices(settings["target_keys"])
+    results = []
+    for index, (device_type, device_id, name, ip, _port, user, password) in enumerate(devices):
+        if device_type != "camera":
+            results.append({"key": f"{device_type}:{device_id}", "name": name, "ip": ip,
+                            "status": "unsupported", "detail": "Brak potwierdzonej natywnej komendy zapisu czasu rejestratora."})
+        else:
+            try:
+                set_time = onvif_set_device_time(ip, user, password, source_time)
+                results.append({"key": f"camera:{device_id}", "name": name, "ip": ip,
+                                "status": "ok", "time": set_time})
+            except Exception as exc:
+                logging.warning("Time sync failed for camera %s (%s): %s", name, ip, exc)
+                results.append({"key": f"camera:{device_id}", "name": name, "ip": ip,
+                                "status": "error", "detail": "Kamera nie przyjęła ustawienia czasu ONVIF."})
+        if index < len(devices) - 1:
+            # Baseline one second, with ±1 second jitter, prevents simultaneous bursts.
+            time_module.sleep(random.uniform(0, 2))
+    now = time_module.time()
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        conn.execute("UPDATE time_sync_settings SET last_run_at = ? WHERE id = 1", (now,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"source": settings["source"], "time": source_time.isoformat(), "results": results}
+
+
+async def time_sync_scheduler():
+    while True:
+        try:
+            settings = load_time_sync_settings()
+            due = time_module.time() - float(settings["last_run_at"]) >= max(1, settings["interval_minutes"]) * 60
+            if settings["enabled"] and due:
+                await asyncio.to_thread(run_time_sync, settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Automatyczna synchronizacja czasu nie powiodła się")
+        await asyncio.sleep(15)
+
+
+@app.get("/api/time-sync/settings")
+def get_time_sync_settings():
+    return load_time_sync_settings()
+
+
+@app.put("/api/time-sync/settings")
+def update_time_sync_settings(update: TimeSyncSettings):
+    if not 1 <= update.interval_minutes <= 1440:
+        raise HTTPException(status_code=422, detail="Interwał musi mieścić się w zakresie 1–1440 minut.")
+    settings = update.model_dump()
+    try:
+        # Validate eagerly, so a bad manual date or NTP hostname is reported on save.
+        if settings["source"] == "manual":
+            resolve_time_source(settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        conn.execute("""UPDATE time_sync_settings
+                        SET source = ?, ntp_server = ?, manual_time = ?, interval_minutes = ?,
+                            target_keys = ?, enabled = ? WHERE id = 1""",
+                     (settings["source"], settings["ntp_server"], settings["manual_time"],
+                      settings["interval_minutes"], json.dumps(settings["target_keys"]), int(settings["enabled"])))
+        conn.commit()
+    finally:
+        conn.close()
+    return load_time_sync_settings()
+
+
+@app.post("/api/time-sync/run")
+def run_time_sync_now():
+    try:
+        return run_time_sync()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail="Nie udało się pobrać czasu ze wskazanego serwera.") from exc
+
+
+@app.put("/api/dvrs/{dvr_id}")
+def update_dvr(dvr_id: int, update: NVRUpdate):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        current = conn.execute("SELECT password FROM dvrs WHERE id = ?", (dvr_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora.")
+        nvr = NVR(name=update.name, ip=update.ip, port=update.port, user=update.user,
+                  password=update.password or current[0])
+        channels = fetch_nvr_channels(nvr)
+        conn.execute("UPDATE dvrs SET name = ?, ip = ?, port = ?, user = ?, password = ? WHERE id = ?",
+                     (nvr.name, nvr.ip, nvr.port, nvr.user, nvr.password, dvr_id))
+        conn.execute("DELETE FROM channels WHERE dvr_id = ?", (dvr_id,))
+        conn.executemany("INSERT INTO channels (dvr_id, channel_number, name) VALUES (?, ?, ?)",
+                         [(dvr_id, channel["channel_number"], channel["name"]) for channel in channels])
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "channels_count": len(channels)}
+
+
+@app.get("/api/devices")
+def get_devices():
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        rows = conn.execute("SELECT id, name, ip, port FROM dvrs ORDER BY name").fetchall()
+        devices = [{"id": r[0], "type": "nvr", "name": r[1], "ip": r[2], "port": r[3],
+                    "channels_count": conn.execute("SELECT COUNT(*) FROM channels WHERE dvr_id = ?", (r[0],)).fetchone()[0]} for r in rows]
+        devices += [{"id": r[0], "type": "camera", "name": r[1], "ip": r[2], "port": r[3], "channels_count": 1}
+                    for r in conn.execute("SELECT id, name, ip, port FROM cameras ORDER BY name").fetchall()]
+        memberships = conn.execute("SELECT category_id, device_type, device_id FROM device_category_items").fetchall()
+        categories = [{"id": r[0], "name": r[1], "hidden": bool(r[2]), "system": r[3] == "all", "device_keys": []}
+                      for r in conn.execute("SELECT id, name, hidden, system_key FROM device_categories ORDER BY system_key DESC, name").fetchall()]
+    finally:
+        conn.close()
+    by_id = {c["id"]: c for c in categories}
+    for category_id, kind, item_id in memberships:
+        if category_id in by_id:
+            by_id[category_id]["device_keys"].append(f"{kind}:{item_id}")
+    return {"devices": devices, "categories": categories}
+
+
+@app.post("/api/devices/scan")
+def scan_devices(request: DeviceScanRequest):
+    # Explicitly supplied addresses are the priority; ONVIF multicast is the
+    # fallback when no scope was provided.
+    try:
+        targets = parse_scan_targets(request.targets) if request.targets.strip() else []
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    found: dict[str, dict] = {}
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        known_nvr_ips = {row[0] for row in conn.execute("SELECT ip FROM dvrs")}
+    finally:
+        conn.close()
+    if targets:
+        with ThreadPoolExecutor(max_workers=min(48, len(targets))) as pool:
+            futures = [pool.submit(scan_host, ip, request.user, request.password, ip in known_nvr_ips) for ip in targets]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    found[result["ip"]] = result
+                    remember_discovery_network(result["ip"])
+    else:
+        pnp_methods: dict[str, str] = {}
+        for result in ws_discover():
+            pnp_methods[result["ip"]] = "ONVIF WS-Discovery"
+        for result in ssdp_discover():
+            pnp_methods[result["ip"]] = (
+                "ONVIF WS-Discovery + UPnP/SSDP" if result["ip"] in pnp_methods else "UPnP/SSDP"
+            )
+        # Prefer real LANs learned from saved devices. Container routes are a
+        # fallback when no device has been saved yet.
+        routed_targets = list(dict.fromkeys([*pnp_methods, *(known_device_network_targets() or routed_ipv4_targets())]))
+        with ThreadPoolExecutor(max_workers=min(48, len(routed_targets) or 1)) as pool:
+            futures = [pool.submit(scan_host, ip, request.user, request.password, ip in known_nvr_ips) for ip in routed_targets]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    result["method"] = pnp_methods.get(result["ip"], "Skan dostępnej podsieci")
+                    found.setdefault(result["ip"], result)
+                    remember_discovery_network(result["ip"])
+    return {"devices": sorted(found.values(), key=lambda item: item["ip"]),
+            "method": "Skan wskazanego zakresu IP" if targets else "ONVIF + UPnP/SSDP + podsieci zapisanych urządzeń"}
+
+
+@app.post("/api/devices/full-scan/start")
+def start_full_local_scan(request: DeviceScanRequest):
+    networks = save_discovery_network_preferences(request.networks) if request.networks else full_local_scan_networks()
+    if not networks:
+        raise HTTPException(status_code=422, detail="Nie znaleziono lokalnej prywatnej podsieci do przeskanowania.")
+    total = sum(network.num_addresses - 2 for network in networks)
+    with DISCOVERY_JOB_LOCK:
+        if DISCOVERY_JOB["running"]:
+            raise HTTPException(status_code=409, detail="Pełne skanowanie już trwa.")
+        DISCOVERY_CANCEL.clear()
+        DISCOVERY_JOB.update({"running": True, "cancelled": False, "network": str(networks[0]),
+                              "completed": 0, "total": total, "devices": [], "error": "",
+                              "networks": [str(network) for network in networks], "network_index": 1})
+        Thread(target=full_local_scan_worker, args=(networks, request.user, request.password), daemon=True).start()
+    return {"networks": [str(network) for network in networks], "total": total}
+
+
+@app.get("/api/devices/full-scan/candidates")
+def get_full_local_scan_candidates():
+    return {"networks": discovery_network_candidates()}
+
+
+@app.post("/api/devices/full-scan/candidates")
+def add_full_local_scan_candidates(selection: DiscoveryNetworkSelection):
+    existing = [item["cidr"] for item in discovery_network_candidates() if item["enabled"]]
+    save_discovery_network_preferences([*existing, *selection.networks])
+    custom_networks = [str(ipaddress.ip_network(value, strict=False)) for value in selection.networks]
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        conn.executemany("UPDATE discovery_scan_networks SET custom = 1, hidden = 0 WHERE cidr = ?",
+                         [(network,) for network in custom_networks])
+        conn.commit()
+    finally:
+        conn.close()
+    return {"networks": discovery_network_candidates()}
+
+
+@app.delete("/api/devices/full-scan/candidates")
+def remove_full_local_scan_candidates(selection: DiscoveryNetworkSelection):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        conn.executemany("INSERT INTO discovery_scan_networks (cidr, enabled, hidden) VALUES (?, 0, 1) ON CONFLICT(cidr) DO UPDATE SET enabled = 0, hidden = 1",
+                         [(value,) for value in selection.networks])
+        conn.commit()
+    finally:
+        conn.close()
+    return {"networks": discovery_network_candidates()}
+
+
+@app.get("/api/devices/full-scan/status")
+def full_local_scan_status():
+    with DISCOVERY_JOB_LOCK:
+        return dict(DISCOVERY_JOB)
+
+
+@app.post("/api/devices/full-scan/cancel")
+def cancel_full_local_scan():
+    DISCOVERY_CANCEL.set()
+    return {"status": "cancelling"}
+
+
+@app.post("/api/cameras/test")
+def test_camera(camera: Camera):
+    try:
+        with socket.create_connection((camera.ip, camera.port), timeout=3):
+            pass
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Nie można połączyć się z kamerą RTSP: {exc}") from exc
+    resolve_camera_connection(camera)
+    verify_camera_rtsp(camera)
+    return {"status": "ok", "type": "camera", "rtsp_path": camera.rtsp_path}
+
+
+@app.post("/api/cameras")
+def add_camera(camera: Camera):
+    test_camera(camera)
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        cursor = conn.execute("INSERT INTO cameras (name, ip, port, user, password, rtsp_path) VALUES (?, ?, ?, ?, ?, ?)",
+                              (camera.name, camera.ip, camera.port, camera.user, camera.password, camera.rtsp_path))
+        camera_id = cursor.lastrowid
+        for category_id in set(camera.category_ids):
+            exists = conn.execute("SELECT 1 FROM device_categories WHERE id = ?", (category_id,)).fetchone()
+            if exists:
+                conn.execute("INSERT OR IGNORE INTO device_category_items VALUES (?, 'camera', ?)", (category_id, camera_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "device_id": camera_id, "type": "camera"}
+
+
+@app.put("/api/cameras/{camera_id}")
+def update_camera(camera_id: int, camera: Camera):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        current = conn.execute("SELECT password FROM cameras WHERE id = ?", (camera_id,)).fetchone()
+        if not current:
+            raise HTTPException(status_code=404, detail="Nie znaleziono kamery.")
+        camera.password = camera.password or current[0]
+        test_camera(camera)
+        conn.execute("""UPDATE cameras SET name = ?, ip = ?, port = ?, user = ?, password = ?, rtsp_path = ?
+                        WHERE id = ?""",
+                     (camera.name, camera.ip, camera.port, camera.user, camera.password, camera.rtsp_path, camera_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "device_id": camera_id, "type": "camera"}
+
+
+@app.post("/api/devices/nvr/{dvr_id}/convert-to-camera")
+def convert_nvr_to_camera(dvr_id: int, camera: Camera):
+    """Move a falsely classified recorder into the independent-camera list."""
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        row = conn.execute("SELECT name, ip, port, user, password FROM dvrs WHERE id = ?", (dvr_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora.")
+        old_name, old_ip, old_port, old_user, old_password = row
+        camera.name = camera.name or old_name
+        camera.ip = camera.ip or old_ip
+        camera.port = camera.port or old_port
+        camera.user = camera.user or old_user
+        camera.password = camera.password or old_password
+        test_camera(camera)
+        cursor = conn.execute(
+            "INSERT INTO cameras (name, ip, port, user, password, rtsp_path) VALUES (?, ?, ?, ?, ?, ?)",
+            (camera.name, camera.ip, camera.port, camera.user, camera.password, camera.rtsp_path),
+        )
+        camera_id = cursor.lastrowid
+        conn.execute("UPDATE device_category_items SET device_type = 'camera', device_id = ? WHERE device_type = 'nvr' AND device_id = ?",
+                     (camera_id, dvr_id))
+        conn.execute("DELETE FROM channels WHERE dvr_id = ?", (dvr_id,))
+        conn.execute("DELETE FROM dvrs WHERE id = ?", (dvr_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "device_id": camera_id, "type": "camera"}
+
+
+@app.post("/api/device-categories")
+def add_device_category(category: DeviceCategory):
+    name = category.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Nazwa kategorii nie może być pusta.")
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        cursor = conn.execute("INSERT INTO device_categories (name, hidden) VALUES (?, ?)", (name, category.hidden))
+        conn.commit()
+        return {"id": cursor.lastrowid, "name": name, "hidden": category.hidden}
+    finally:
+        conn.close()
+
+
+@app.put("/api/device-categories/{category_id}")
+def update_device_category(category_id: int, category: DeviceCategory):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        if not conn.execute("SELECT 1 FROM device_categories WHERE id = ?", (category_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Nie znaleziono kategorii.")
+        conn.execute("UPDATE device_categories SET name = ?, hidden = ? WHERE id = ?", (category.name.strip(), category.hidden, category_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success"}
+
+
+@app.delete("/api/device-categories/{category_id}")
+def delete_device_category(category_id: int):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        system = conn.execute("SELECT system_key FROM device_categories WHERE id = ?", (category_id,)).fetchone()
+        if not system:
+            raise HTTPException(status_code=404, detail="Nie znaleziono kategorii.")
+        if system[0] == "all":
+            raise HTTPException(status_code=400, detail="Kategoria „Wszystkie urządzenia” jest stała i nie może zostać usunięta.")
+        conn.execute("DELETE FROM device_category_items WHERE category_id = ?", (category_id,))
+        conn.execute("DELETE FROM device_categories WHERE id = ?", (category_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success"}
+
+
+@app.put("/api/device-categories/{category_id}/members")
+def update_category_members(category_id: int, members: CategoryMembers):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        row = conn.execute("SELECT system_key FROM device_categories WHERE id = ?", (category_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Nie znaleziono kategorii.")
+        if row[0] == "all":
+            raise HTTPException(status_code=400, detail="Stała kategoria zawiera zawsze wszystkie urządzenia.")
+        for key in set(members.device_keys):
+            try:
+                kind, raw_id = key.split(":", 1)
+                item_id = int(raw_id)
+            except ValueError:
+                continue
+            if kind not in {"nvr", "camera"}:
+                continue
+            table = "dvrs" if kind == "nvr" else "cameras"
+            if conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (item_id,)).fetchone():
+                conn.execute("DELETE FROM device_category_items WHERE device_type = ? AND device_id = ?", (kind, item_id))
+                conn.execute("INSERT INTO device_category_items VALUES (?, ?, ?)", (category_id, kind, item_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success"}
+
+
+@app.put("/api/device-category-assignments")
+def update_device_category_assignments(data: DeviceAssignments):
+    """Assign every device to at most one custom category (folder semantics)."""
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        valid_categories = {r[0] for r in conn.execute("SELECT id FROM device_categories WHERE system_key IS NULL")}
+        for key, category_id in data.assignments.items():
+            try:
+                kind, raw_id = key.split(":", 1)
+                device_id = int(raw_id)
+            except ValueError:
+                continue
+            if kind not in {"nvr", "camera"}:
+                continue
+            table = "dvrs" if kind == "nvr" else "cameras"
+            if not conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (device_id,)).fetchone():
+                continue
+            conn.execute("DELETE FROM device_category_items WHERE device_type = ? AND device_id = ?", (kind, device_id))
+            if category_id in valid_categories:
+                conn.execute("INSERT INTO device_category_items VALUES (?, ?, ?)", (category_id, kind, device_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success"}
+
+
 @app.post("/api/webrtc")
 def start_webrtc_session(offer: WebRTCOffer, request: Request):
     """Rejestruje strumień RTSP (#media=video) w go2rtc i zwraca SDP Answer z lokalnym kandydatem ICE."""
@@ -628,6 +1980,25 @@ def start_webrtc_session(offer: WebRTCOffer, request: Request):
         raise HTTPException(status_code=502, detail=f"Błąd połączenia z go2rtc: {str(e)}")
 
 
+@app.post("/api/cameras/{camera_id}/webrtc")
+def start_camera_webrtc_session(camera_id: int, offer: WebRTCOffer, request: Request):
+    """The offer shape stays compatible with the NVR endpoint; channel is ignored."""
+    try:
+        stream_name = ensure_camera_stream(camera_id, offer.stream)
+        w_req = urllib.request.Request(
+            f"{GO2RTC_API}/api/webrtc?src={urllib.parse.quote(stream_name)}", data=offer.sdp.encode("utf-8"),
+            headers={"Content-Type": "application/sdp"}, method="POST")
+        with urllib.request.urlopen(w_req, timeout=20.0) as response:
+            answer_sdp = response.read().decode("utf-8")
+        host_ip = request.url.hostname or "127.0.0.1"
+        if host_ip == "localhost": host_ip = "127.0.0.1"
+        return {"type": "answer", "sdp": answer_sdp.rstrip("\r\n") + f"\r\na=candidate:1001 1 udp 2130706431 {host_ip} 8555 typ host\r\n"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Błąd połączenia z kamerą: {exc}") from exc
+
+
 @app.get("/api/stream.mp4")
 def proxy_mp4_stream(dvr_id: int, channel: int, stream: int = 2):
     """Copy H.264 from the relay into fMP4 without its HTTP MP4 consumer."""
@@ -642,6 +2013,16 @@ def proxy_mp4_stream(dvr_id: int, channel: int, stream: int = 2):
         raise HTTPException(status_code=502, detail="Nie udało się odebrać obrazu z przekaźnika.") from exc
     return StreamingResponse(proxy.chunks(), media_type="video/mp4",
                              background=BackgroundTask(proxy.close))
+
+
+@app.get("/api/cameras/{camera_id}/stream.mp4")
+def proxy_camera_mp4_stream(camera_id: int, stream: int = 2):
+    stream_name = ensure_camera_stream(camera_id, stream)
+    binary = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
+    if not binary:
+        raise HTTPException(status_code=503, detail="Brak FFmpeg do podglądu obrazu.")
+    proxy = open_mp4_proxy(binary, f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264", stream_needs_color_normalization(stream_name))
+    return StreamingResponse(proxy.chunks(), media_type="video/mp4", background=BackgroundTask(proxy.close))
 
 
 def get_recording_dvr(dvr_id: int) -> tuple[str, str, int, str, str]:
@@ -796,11 +2177,162 @@ def get_recording_files(dvr_id: int, channel: int, date: str):
     return {"files": files, "date": date, "channel": channel, "dvr_id": dvr_id}
 
 
-ARCHIVE_JOBS = BoundedSemaphore(2)
+try:
+    ARCHIVE_JOB_LIMIT = max(1, int(os.environ.get("ARCHIVE_MAX_CONCURRENT_JOBS", "2")))
+except ValueError:
+    ARCHIVE_JOB_LIMIT = 2
+ARCHIVE_JOBS = BoundedSemaphore(ARCHIVE_JOB_LIMIT)
+
+
+def download_owner(request: Request) -> str:
+    """Stable per-user key; anonymous browsers supply their own random id."""
+    user = request.session.get("user") or {}
+    provider, subject = user.get("provider"), user.get("subject")
+    if provider and subject:
+        return f"user:{provider}:{subject}"
+    browser_id = request.headers.get("X-Download-Client", "")
+    if not re.fullmatch(r"[a-f0-9-]{16,64}", browser_id):
+        raise HTTPException(status_code=400, detail="Brak identyfikatora przeglądarki pobrań.")
+    return f"browser:{browser_id}"
+
+
+class DownloadJobRequest(BaseModel):
+    dvr_id: int
+    channel: int
+    date: str
+    filename: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    format: Literal["avi", "mp4"] = "avi"
+    quality: Literal["original", "1080p", "720p", "480p"] = "original"
+    anonymize: bool = False
+
+
+def update_download_job(job_id: str, **values):
+    if not values:
+        return
+    assignments = ", ".join(f"{column} = ?" for column in values)
+    with sqlite3.connect("data/dvrs.db") as conn:
+        conn.execute(f"UPDATE download_jobs SET {assignments} WHERE id = ?", (*values.values(), job_id))
+
+
+def job_row(row, now=None):
+    now = time_module.time() if now is None else now
+    data = dict(zip(("id", "created_at", "started_at", "finished_at", "dvr_id", "dvr_name", "channel",
+                     "camera_name", "recording_date", "start_time", "end_time", "filename", "output_format",
+                     "quality", "anonymized", "status", "stage", "progress", "result_name", "error",
+                     "duration_seconds"), row))
+    data["anonymized"] = bool(data["anonymized"])
+    data["progress"] = round(float(data["progress"]), 1)
+    data["elapsed_seconds"] = round(max(0, (data["finished_at"] or now) - (data["started_at"] or data["created_at"])))
+    return data
+
+
+class DownloadJobs:
+    def __init__(self, workers: int):
+        self.workers = workers
+        self.queue = Queue()
+        self.stop_event = Event()
+        self.threads = []
+        self.dvr_locks = {}
+        self.dvr_locks_guard = Lock()
+
+    def start(self):
+        if self.threads:
+            return
+        with sqlite3.connect("data/dvrs.db") as conn:
+            conn.execute("UPDATE download_jobs SET status = 'queued', started_at = NULL, stage = 'Oczekuje po restarcie' WHERE status = 'processing'")
+            pending = conn.execute("SELECT id FROM download_jobs WHERE status = 'queued' ORDER BY created_at").fetchall()
+        for (job_id,) in pending:
+            self.queue.put(job_id)
+        self.threads = [Thread(target=self._worker, daemon=True, name=f"download-worker-{number}")
+                        for number in range(self.workers)]
+        for thread in self.threads:
+            thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        for _ in self.threads:
+            self.queue.put(None)
+        for thread in self.threads:
+            thread.join(timeout=2)
+        self.threads = []
+
+    def enqueue(self, job_id: str):
+        self.queue.put(job_id)
+
+    def _dvr_lock(self, dvr_id: int):
+        with self.dvr_locks_guard:
+            return self.dvr_locks.setdefault(dvr_id, Lock())
+
+    def _worker(self):
+        while not self.stop_event.is_set():
+            try:
+                job_id = self.queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if job_id is None:
+                return
+            try:
+                self._run(job_id)
+            except Exception:
+                logging.getLogger(__name__).exception("Nieobsłużony błąd zadania pobrania %s", job_id)
+            finally:
+                self.queue.task_done()
+
+    def _run(self, job_id: str):
+        with sqlite3.connect("data/dvrs.db") as conn:
+            row = conn.execute("SELECT id, dvr_id, channel, recording_date, filename, start_time, end_time, output_format, quality, anonymized FROM download_jobs WHERE id = ? AND status = 'queued'", (job_id,)).fetchone()
+        if not row:
+            return
+        _, dvr_id, channel, date, filename, start_time, end_time, output_format, quality, anonymized = row
+        recorder_lock = self._dvr_lock(dvr_id)
+        if not recorder_lock.acquire(blocking=False):
+            # A number of NVRs allow only one archive session at a time.
+            # Keep the global worker available for a different recorder.
+            update_download_job(job_id, stage="Oczekuje na eksport z tego rejestratora", progress=0)
+            self.queue.put(job_id)
+            time_module.sleep(0.2)
+            return
+        started = time_module.time()
+        update_download_job(job_id, status="processing", stage="Pobieranie materiału z rejestratora", progress=1,
+                            started_at=started, error=None)
+
+        def report(stage, progress):
+            update_download_job(job_id, stage=stage, progress=max(1, min(99, progress)))
+
+        folder = None
+        acquired = False
+        try:
+            # The legacy direct endpoint shares this same limiter, so every
+            # user together can never make more than two recorder transfers.
+            ARCHIVE_JOBS.acquire()
+            acquired = True
+            folder, result, result_name = build_queued_recording(
+                dvr_id, channel, date, filename, start_time, end_time, output_format, quality,
+                bool(anonymized), report,
+            )
+            update_download_job(job_id, status="ready", stage="Gotowe do pobrania", progress=100,
+                                finished_at=time_module.time(), duration_seconds=time_module.time() - started,
+                                result_path=str(result), result_name=result_name)
+        except (ArchiveError, HTTPException, OSError, ValueError) as exc:
+            if folder:
+                shutil.rmtree(folder, ignore_errors=True)
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            update_download_job(job_id, status="failed", stage="Nie udało się przygotować nagrania", progress=0,
+                                finished_at=time_module.time(), duration_seconds=time_module.time() - started,
+                                error=detail)
+        finally:
+            if acquired:
+                ARCHIVE_JOBS.release()
+            recorder_lock.release()
+
+
+download_jobs = DownloadJobs(ARCHIVE_JOB_LIMIT)
 
 
 def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, preview,
-                      output_format="avi", quality="original"):
+                      output_format="avi", quality="original", anonymize=False):
     if output_format not in ("avi", "mp4") or quality not in ("original", "1080p", "720p", "480p"):
         raise HTTPException(status_code=422, detail="Nieprawidłowy format lub jakość nagrania.")
     if channel < 1:
@@ -857,7 +2389,17 @@ def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, pre
         codec, fps, count = save_video(ip, port, user, password, selections, source)
         suffix = "mp4" if preview else output_format
         result = folder / f"recording.{suffix}"
-        convert_video(source, result, codec, fps, preview=preview, quality=quality)
+        if anonymize:
+            # Never downscale before detecting faces.  The full recorder
+            # archive is wrapped first, then masked, and only then converted
+            # to the quality requested for download.
+            detector_input = folder / "detector-input.mp4"
+            convert_video(source, detector_input, codec, fps, quality="original")
+            masked = folder / "masked.mp4"
+            anonymize_faces(detector_input, masked)
+            convert_video(masked, result, "h264", fps, preview=preview, quality=quality, source_is_container=True)
+        else:
+            convert_video(source, result, codec, fps, preview=preview, quality=quality)
         headers = {"Cache-Control": "no-store", "X-Archive-Audio": "none"}
         if preview:
             headers["X-Preview-Seconds"] = str(round(count / fps, 2))
@@ -890,15 +2432,161 @@ def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, pre
         ARCHIVE_JOBS.release()
 
 
+def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time,
+                           output_format, quality, anonymize, report):
+    """Prepare one persisted queue item; the worker owns the temporary folder."""
+    if output_format not in ("avi", "mp4") or quality not in ("original", "1080p", "720p", "480p"):
+        raise HTTPException(status_code=422, detail="Nieprawidłowy format lub jakość nagrania.")
+    _, ip, port, user, password = get_recording_dvr(dvr_id)
+    start_time, end_time = validate_recording_request(date, filename, start_time, end_time)
+    available = get_recording_files(dvr_id, channel, date)["files"]
+    if filename:
+        matches = [item for item in available if item["filename"] == filename]
+        if not matches:
+            raise HTTPException(status_code=404, detail="Wybrany plik nie jest już dostępny w archiwum.")
+        recording = Recording.parse(filename)
+        if recording.channel != channel:
+            raise HTTPException(status_code=422, detail="Plik nie należy do wybranej kamery.")
+        selections = [(recording, recording.start, recording.end)]
+    else:
+        begin = datetime.fromisoformat(f"{date}T{start_time}")
+        finish = datetime.fromisoformat(f"{date}T{end_time}")
+        selections = []
+        for item in available:
+            recording = Recording.parse(item["filename"])
+            if recording.channel != channel:
+                continue
+            left, right = max(begin, recording.start), min(finish, recording.end)
+            if left < right:
+                selections.append((recording, left, right))
+        selections.sort(key=lambda selection: selection[1])
+        unique, covered_until = [], begin
+        for recording, left, right in selections:
+            left = max(left, covered_until)
+            if left < right:
+                unique.append((recording, left, right))
+                covered_until = right
+        selections = unique
+    if not selections:
+        raise HTTPException(status_code=404, detail="Brak nagrań w wybranym zakresie.")
+
+    scratch = Path("data/archive-jobs")
+    scratch.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="download-", dir=scratch))
+    try:
+        source = folder / "source.video"
+        report("Pobieranie materiału z rejestratora", 5)
+        codec, fps, _ = save_video(ip, port, user, password, selections, source)
+        detector_input = folder / "detector-input.mp4"
+        if anonymize:
+            report("Przygotowanie materiału HQ do anonimizacji", 35)
+            convert_video(source, detector_input, codec, fps, quality="original")
+            masked = folder / "masked.mp4"
+            report("Wykrywanie i zasłanianie głów", 40)
+            anonymize_faces(detector_input, masked,
+                            lambda fraction: report("Wykrywanie i zasłanianie głów", 40 + (fraction or 0) * 45))
+            report("Kodowanie pliku wynikowego", 86)
+            input_file, input_codec = masked, "h264"
+        else:
+            input_file, input_codec = source, codec
+            report("Kodowanie pliku wynikowego", 65)
+        result = folder / f"recording.{output_format}"
+        convert_video(input_file, result, input_codec, fps, quality=quality,
+                      source_is_container=anonymize)
+        result_name = (f"nvr-{dvr_id}-kamera-{channel}-{selections[0][1]:%Y-%m-%d_%H-%M-%S}_"
+                       f"{selections[-1][2]:%H-%M-%S}.{output_format}")
+        return folder, result, result_name
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+
 @app.get("/api/recordings/download")
 def download_recording(
     dvr_id: int, channel: int, date: str, filename: str | None = None,
     start_time: str | None = None, end_time: str | None = None,
     format: Literal["avi", "mp4"] = "avi",
     quality: Literal["original", "1080p", "720p", "480p"] = "original",
+    anonymize: bool = False,
 ):
     return prepare_recording(dvr_id, channel, date, filename, start_time, end_time, False,
-                             output_format=format, quality=quality)
+                             output_format=format, quality=quality, anonymize=anonymize)
+
+
+@app.post("/api/download-jobs")
+def create_download_job(payload: DownloadJobRequest, request: Request):
+    owner_id = download_owner(request)
+    if payload.channel < 1:
+        raise HTTPException(status_code=422, detail="Numer kanału musi być dodatni.")
+    start_time, end_time = validate_recording_request(payload.date, payload.filename,
+                                                       payload.start_time, payload.end_time)
+    with sqlite3.connect("data/dvrs.db") as conn:
+        dvr = conn.execute("SELECT name FROM dvrs WHERE id = ?", (payload.dvr_id,)).fetchone()
+        if not dvr:
+            raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora.")
+        channel_row = conn.execute("SELECT name FROM channels WHERE dvr_id = ? AND channel_number = ?",
+                                   (payload.dvr_id, payload.channel)).fetchone()
+        camera_name = (channel_row[0] if channel_row and channel_row[0]
+                       else f"Kamera {payload.channel}")
+        job_id, created = uuid4().hex, time_module.time()
+        conn.execute('''INSERT INTO download_jobs
+                     (id, owner_id, created_at, dvr_id, dvr_name, channel, camera_name, recording_date,
+                      start_time, end_time, filename, output_format, quality, anonymized, status, stage, progress)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'Oczekuje w kolejce', 0)''',
+                     (job_id, owner_id, created, payload.dvr_id, dvr[0], payload.channel, camera_name,
+                      payload.date, start_time, end_time, payload.filename, payload.format, payload.quality,
+                      int(payload.anonymize)))
+    download_jobs.enqueue(job_id)
+    return {"id": job_id, "status": "queued"}
+
+
+def load_owned_job(job_id: str, owner_id: str):
+    columns = ("id, created_at, started_at, finished_at, dvr_id, dvr_name, channel, camera_name, recording_date, "
+               "start_time, end_time, filename, output_format, quality, anonymized, status, stage, progress, "
+               "result_name, error, duration_seconds")
+    with sqlite3.connect("data/dvrs.db") as conn:
+        row = conn.execute(f"SELECT {columns} FROM download_jobs WHERE id = ? AND owner_id = ?", (job_id, owner_id)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono zadania pobrania.")
+    return row
+
+
+@app.get("/api/download-jobs")
+def list_download_jobs(request: Request):
+    owner_id = download_owner(request)
+    columns = ("id, created_at, started_at, finished_at, dvr_id, dvr_name, channel, camera_name, recording_date, "
+               "start_time, end_time, filename, output_format, quality, anonymized, status, stage, progress, "
+               "result_name, error, duration_seconds")
+    with sqlite3.connect("data/dvrs.db") as conn:
+        rows = conn.execute(f"SELECT {columns} FROM download_jobs WHERE owner_id = ? ORDER BY created_at DESC LIMIT 100", (owner_id,)).fetchall()
+        average_row = conn.execute("SELECT AVG(duration_seconds) FROM download_jobs WHERE status = 'ready' AND duration_seconds > 0").fetchone()
+        active_count = conn.execute("SELECT COUNT(*) FROM download_jobs WHERE status = 'processing'").fetchone()[0]
+    average = max(30, round(average_row[0] or 90))
+    jobs = [job_row(row) for row in rows]
+    for job in jobs:
+        if job["status"] == "queued":
+            with sqlite3.connect("data/dvrs.db") as conn:
+                before = conn.execute("SELECT COUNT(*) FROM download_jobs WHERE status = 'queued' AND created_at < ?", (job["created_at"],)).fetchone()[0]
+            job["queue_position"] = before + 1
+            job["eta_seconds"] = max(0, (before + max(0, active_count - ARCHIVE_JOB_LIMIT + 1)) * average)
+        elif job["status"] == "processing":
+            job["eta_seconds"] = max(0, average - job["elapsed_seconds"])
+    return {"jobs": jobs, "concurrency": ARCHIVE_JOB_LIMIT}
+
+
+@app.get("/api/download-jobs/{job_id}/file")
+def download_job_file(job_id: str, request: Request):
+    owner_id = download_owner(request)
+    with sqlite3.connect("data/dvrs.db") as conn:
+        row = conn.execute("SELECT status, result_path, result_name FROM download_jobs WHERE id = ? AND owner_id = ?",
+                           (job_id, owner_id)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono zadania pobrania.")
+    status, result_path, result_name = row
+    if status != "ready" or not result_path or not Path(result_path).is_file():
+        raise HTTPException(status_code=409, detail="Plik nie jest jeszcze gotowy.")
+    return FileResponse(result_path, filename=result_name, media_type="application/octet-stream",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/recordings/preview")

@@ -1,4 +1,4 @@
-const DEFAULTS = Object.freeze({ format: 'avi', quality: 'original', askEveryTime: false });
+const DEFAULTS = Object.freeze({ format: 'avi', quality: 'original', askEveryTime: false, anonymize: false });
 const STORAGE_KEY = 'nvr.downloads.v1';
 const FORMATS = { avi: 'video/x-msvideo', mp4: 'video/mp4' };
 
@@ -7,6 +7,7 @@ export function normalizeSettings(value = {}) {
         format: Object.hasOwn(FORMATS, value?.format) ? value.format : DEFAULTS.format,
         quality: ['original', '1080p', '720p', '480p'].includes(value?.quality) ? value.quality : DEFAULTS.quality,
         askEveryTime: value?.askEveryTime === true,
+        anonymize: value?.anonymize === true,
     };
 }
 
@@ -90,7 +91,23 @@ let settings = { ...DEFAULTS };
 let directory = null;
 let ready = false;
 let activeDownload = null;
+let localTransferJobId = null;
+const pendingDestinations = new Map();
+const DOWNLOAD_CLIENT_KEY = 'nvr.download-client-id.v1';
 const element = id => document.getElementById(id);
+
+function downloadClientId() {
+    let value = localStorage.getItem(DOWNLOAD_CLIENT_KEY);
+    if (!value) {
+        value = crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+        localStorage.setItem(DOWNLOAD_CLIENT_KEY, value);
+    }
+    return value;
+}
+
+function downloadHeaders(extra = {}) {
+    return { 'X-Download-Client': downloadClientId(), ...extra };
+}
 
 function supported() {
     return window.isSecureContext && typeof window.showDirectoryPicker === 'function'
@@ -107,6 +124,7 @@ function drawSettings() {
     element('download-ask').checked = settings.askEveryTime;
     element('download-format').value = settings.format;
     element('download-quality').value = settings.quality;
+    element('download-anonymize').checked = settings.anonymize;
     element('download-format-note').textContent = settings.quality === 'original'
         ? 'Oryginał zachowuje kodek, rozdzielczość i jakość nagrania. MP4 z HEVC wymaga odtwarzacza obsługującego HEVC.'
         : 'Obraz zostanie zapisany w H.264. Rozdzielczość będzie zmniejszona do wybranego limitu; mniejszych nagrań nie powiększamy.';
@@ -124,6 +142,7 @@ function saveSettings() {
         format: element('download-format').value,
         quality: element('download-quality').value,
         askEveryTime: element('download-ask').checked,
+        anonymize: element('download-anonymize').checked,
     });
     try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
@@ -203,7 +222,6 @@ async function saveResponse(response, destination, controller) {
 }
 
 async function requestDownload(params) {
-    if (activeDownload) { transferMessage('Trwa już zapisywanie nagrania. Poczekaj na zakończenie.'); return; }
     if (!ready) { transferMessage('Trwa wczytywanie ustawień. Spróbuj za chwilę.', 'error'); return; }
     if (!supported()) {
         transferMessage(window.isSecureContext
@@ -212,32 +230,95 @@ async function requestDownload(params) {
         return;
     }
     const selected = { ...settings };
-    const controller = new AbortController();
-    activeDownload = controller;
     try {
-        // Pick the destination during the click's user activation, before any
-        // network request. Never fall back to a browser-controlled download.
+        // The picker must run in this click. The server job continues in the
+        // background and does not keep a camera/archive HTTP request open.
         const destination = await chooseDestination(suggestedFilename(params, selected.format), selected);
-        if (controller.signal.aborted) throw new DOMException('Anulowano.', 'AbortError');
-        element('download-progress').removeAttribute('value');
-        transferMessage('Przygotowywanie nagrania… Dłuższy materiał może wymagać kilku minut.');
-        const query = new URLSearchParams({ ...params, format: selected.format, quality: selected.quality });
-        const response = await fetch('/api/recordings/download?' + query, { signal: controller.signal, cache: 'no-store' });
+        transferMessage('Dodawanie nagrania do kolejki…');
+        const response = await fetch('/api/download-jobs', {
+            method: 'POST', cache: 'no-store', headers: downloadHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ ...params, format: selected.format, quality: selected.quality, anonymize: selected.anonymize }),
+        });
         if (!response.ok) {
             let message = `Nie udało się pobrać nagrania (${response.status}).`;
             try { message = (await response.json()).detail || message; } catch (_) {}
             throw new Error(message);
         }
-        const save = () => saveResponse(response, destination, controller);
-        // Serialize filename allocation across tabs sharing the chosen folder.
-        if (navigator.locks) await navigator.locks.request('nvr-recording-save', save);
-        else await save();
+        const job = await response.json();
+        pendingDestinations.set(job.id, destination);
+        transferMessage('Nagranie dodano do kolejki. Postęp znajdziesz w zakładce Pobrania.', 'success');
+        await refreshDownloadJobs();
     } catch (error) {
         transferMessage(error.name === 'AbortError' ? 'Anulowano pobieranie.' : error.message || 'Nie udało się zapisać nagrania.',
                         error.name === 'AbortError' ? 'cancelled' : 'error');
+    }
+}
+
+function durationText(seconds) {
+    seconds = Math.max(0, Math.round(seconds || 0));
+    const minutes = Math.floor(seconds / 60);
+    return minutes ? `${minutes} min ${seconds % 60} s` : `${seconds} s`;
+}
+
+function escapeHtml(value) {
+    const node = document.createElement('span');
+    node.textContent = value || '';
+    return node.innerHTML;
+}
+
+async function saveQueuedJob(jobId, filename = `nagranie-${jobId}.mp4`) {
+    if (activeDownload) return transferMessage('Trwa już zapisywanie pliku.', 'error');
+    const destination = pendingDestinations.get(jobId) || await chooseDestination(filename, settings);
+    const controller = new AbortController();
+    activeDownload = controller;
+    localTransferJobId = jobId;
+    refreshDownloadJobs();
+    try {
+        const response = await fetch(`/api/download-jobs/${encodeURIComponent(jobId)}/file`, {
+            signal: controller.signal, cache: 'no-store', headers: downloadHeaders(),
+        });
+        if (!response.ok) throw new Error('Plik nie jest już dostępny.');
+        const save = () => saveResponse(response, destination, controller);
+        if (navigator.locks) await navigator.locks.request('nvr-recording-save', save); else await save();
+        pendingDestinations.delete(jobId);
+    } catch (error) {
+        transferMessage(error.name === 'AbortError' ? 'Anulowano pobieranie.' : error.message || 'Nie udało się zapisać nagrania.', 'error');
     } finally {
         activeDownload = null;
+        localTransferJobId = null;
+        refreshDownloadJobs();
     }
+}
+
+function renderDownloadJobs(jobs) {
+    const current = element('download-jobs-current');
+    const history = element('download-jobs-history');
+    if (!current || !history) return;
+    const active = jobs.filter(job => ['queued', 'processing'].includes(job.status));
+    const transfer = localTransferJobId ? jobs.find(job => job.id === localTransferJobId) : null;
+    current.innerHTML = (transfer ? `<div style="margin:8px 0;"><strong>${escapeHtml(transfer.camera_name)}</strong> — pobieranie pliku do komputera…</div>` : '')
+        + (active.length ? active.map(job => {
+        const suffix = job.status === 'queued'
+            ? `kolejka: ${job.queue_position}, orientacyjnie: ${durationText(job.eta_seconds)}`
+            : `${job.progress}% · trwa: ${durationText(job.elapsed_seconds)} · do końca: ok. ${durationText(job.eta_seconds)}`;
+        return `<div style="margin:8px 0;"><strong>${escapeHtml(job.camera_name)}</strong> — ${escapeHtml(job.stage)}<br><progress max="100" value="${job.progress}"></progress> ${suffix}</div>`;
+    }).join('') : (transfer ? '' : 'Brak aktywnych pobrań.'));
+    history.innerHTML = jobs.length ? jobs.map(job => {
+        const status = job.status === 'ready' ? 'Gotowe' : job.status === 'failed' ? `Błąd: ${job.error || 'nieznany'}`
+            : job.status === 'queued' ? `W kolejce (${job.queue_position})` : `${job.stage} — ${job.progress}%`;
+        const action = job.status === 'ready' ? `<button type="button" data-download-job="${job.id}" data-download-name="${escapeHtml(job.result_name)}">Pobierz plik</button>` : '';
+        return `<tr><td>${new Date(job.created_at * 1000).toLocaleString()}</td><td>${escapeHtml(job.dvr_name)} / ${escapeHtml(job.camera_name)}</td><td>${escapeHtml(job.recording_date)} ${escapeHtml(job.start_time)}–${escapeHtml(job.end_time)}</td><td>${job.anonymized ? 'Tak' : 'Nie'}</td><td>${escapeHtml(status)}</td><td>${action}</td></tr>`;
+    }).join('') : '<tr><td colspan="6" class="devices-result-empty">Nie ma jeszcze pobrań.</td></tr>';
+    history.querySelectorAll('[data-download-job]').forEach(button => button.addEventListener('click', () => saveQueuedJob(button.dataset.downloadJob, button.dataset.downloadName)));
+}
+
+export async function refreshDownloadJobs() {
+    if (typeof document === 'undefined') return;
+    try {
+        const response = await fetch('/api/download-jobs', { cache: 'no-store', headers: downloadHeaders() });
+        if (!response.ok) return;
+        renderDownloadJobs((await response.json()).jobs || []);
+    } catch (_) {}
 }
 
 async function initialize() {
@@ -254,7 +335,7 @@ async function initialize() {
             ? 'Ta przeglądarka nie obsługuje wyboru miejsca zapisu. Użyj aktualnego Chrome lub Edge. Nagrania nie będą zapisywane w przypadkowym folderze.'
             : 'Przy dostępie zdalnym wybór folderu wymaga HTTPS. Lokalnie użyj adresu localhost lub 127.0.0.1.';
     }
-    ['download-ask', 'download-format', 'download-quality'].forEach(id => element(id).addEventListener('change', saveSettings));
+    ['download-ask', 'download-format', 'download-quality', 'download-anonymize'].forEach(id => element(id).addEventListener('change', saveSettings));
     element('download-choose-folder').addEventListener('click', async () => {
         try { await chooseDirectory(); } catch (error) {
             if (error.name !== 'AbortError') settingsMessage(error.message || 'Nie udało się wybrać folderu.', true);
@@ -262,9 +343,12 @@ async function initialize() {
     });
     element('download-cancel').addEventListener('click', () => activeDownload?.abort());
     element('download-dismiss').addEventListener('click', () => { element('download-notice').hidden = true; });
+    window.setInterval(refreshDownloadJobs, 3000);
+    refreshDownloadJobs();
 }
 
 if (typeof document !== 'undefined') {
     window.requestRecordingDownload = requestDownload;
+    window.refreshDownloadJobs = refreshDownloadJobs;
     initialize();
 }
