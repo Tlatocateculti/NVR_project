@@ -44,6 +44,53 @@ def anonymize_worker_count() -> int:
     return max(1, min(8, (available + concurrent_jobs - 1) // concurrent_jobs))
 
 
+def openvino_yolo_head_detector(model: Path, cv2, np):
+    """Return a YOLOv8 head detector using OpenVINO CPU inference, or None."""
+    if not model.exists():
+        return None
+    try:
+        from openvino import Core
+        compiled = Core().compile_model(str(model), "CPU")
+        input_layer, output_layer = compiled.input(0), compiled.output(0)
+    except Exception:
+        return None
+
+    def detect(frame, conf_threshold=0.20):
+        height, width = frame.shape[:2]
+        tile_size, tile_step = 640, 512
+        x_starts = list(range(0, max(1, width - tile_size + 1), tile_step))
+        y_starts = list(range(0, max(1, height - tile_size + 1), tile_step))
+        if x_starts[-1] != max(0, width - tile_size):
+            x_starts.append(max(0, width - tile_size))
+        if y_starts[-1] != max(0, height - tile_size):
+            y_starts.append(max(0, height - tile_size))
+
+        boxes, scores = [], []
+        for top in y_starts:
+            for left in x_starts:
+                tile = frame[top:min(height, top + tile_size), left:min(width, left + tile_size)]
+                tile_height, tile_width = tile.shape[:2]
+                if tile_height != 640 or tile_width != 640:
+                    padded = np.zeros((640, 640, 3), dtype=tile.dtype)
+                    padded[:tile_height, :tile_width] = tile
+                    tile = padded
+                blob = np.ascontiguousarray((tile.astype(np.float32) / 255.0).transpose(2, 0, 1)[None])
+                preds = compiled({input_layer: blob})[output_layer][0].T
+                for cx, cy, bw, bh, conf in preds:
+                    if conf >= conf_threshold and 0 <= cx < tile_width and 0 <= cy < tile_height:
+                        bx = max(0, int(left + cx - bw / 2))
+                        by = max(0, int(top + cy - bh / 2))
+                        bw_i = min(width - bx, int(bw))
+                        bh_i = min(height - by, int(bh))
+                        if bw_i >= 10 and bh_i >= 10:
+                            boxes.append([bx, by, bw_i, bh_i])
+                            scores.append(float(conf))
+        kept = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.40) if boxes else []
+        return [(boxes[int(i)], scores[int(i)]) for i in (kept.flatten() if len(kept) > 0 else [])]
+
+    return detect
+
+
 def openvino_face_detector(model: Path, cv2, np):
     """Return Intel Open Model Zoo face detection, or ``None`` if unavailable."""
     if not model.exists() or not model.with_suffix(".bin").exists():
@@ -56,11 +103,8 @@ def openvino_face_detector(model: Path, cv2, np):
     except Exception:
         return None
 
-    def detect(frame):
+    def detect(frame, conf_threshold=0.30):
         height, width = frame.shape[:2]
-        # The detector accepts 300×300 input.  Feeding a whole CCTV frame
-        # makes distant faces just a few pixels wide, so infer overlapping
-        # native-resolution tiles and run NMS once across all detections.
         tile_size, tile_step = 640, 512
         x_starts = list(range(0, max(1, width - tile_size + 1), tile_step))
         y_starts = list(range(0, max(1, height - tile_size + 1), tile_step))
@@ -77,39 +121,21 @@ def openvino_face_detector(model: Path, cv2, np):
                 blob = np.ascontiguousarray(resized.transpose(2, 0, 1)[None])
                 result = compiled({input_layer: blob})[output_layer].reshape(-1, 7)
                 for _, _, confidence, x1, y1, x2, y2 in result:
-                    if confidence < 0.35:
+                    if confidence < conf_threshold:
                         continue
                     x1, y1 = left + max(0, x1 * tile_width), top + max(0, y1 * tile_height)
                     x2, y2 = left + min(tile_width, x2 * tile_width), top + min(tile_height, y2 * tile_height)
                     if x2 - x1 >= 10 and y2 - y1 >= 10:
-                        boxes.append([x1, y1, x2 - x1, y2 - y1])
+                        boxes.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
                         scores.append(float(confidence))
-        kept = cv2.dnn.NMSBoxes(boxes, scores, 0.35, 0.35) if boxes else []
-        faces = []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        for index in kept:
-            x1, y1, box_width, box_height = boxes[int(index)]
-            x2, y2 = x1 + box_width, y1 + box_height
-            region = gray[int(y1):int(y2), int(x1):int(x2)]
-            points = cv2.goodFeaturesToTrack(region, maxCorners=8, qualityLevel=0.01,
-                                              minDistance=4, blockSize=5)
-            if points is None:
-                points = np.array([[x1 + box_width / 2, y1 + box_height / 2]], dtype="float32")
-            else:
-                points = points.reshape(-1, 2) + np.array([x1, y1], dtype="float32")
-            faces.append(([x1, y1, box_width, box_height], points.astype("float32")))
-        return faces
+        kept = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.35) if boxes else []
+        return [(boxes[int(i)], scores[int(i)]) for i in (kept.flatten() if len(kept) > 0 else [])]
 
     return detect
 
 
 def openvino_person_detector(model: Path, cv2, np):
-    """Return a CPU person detector used to make head masking persistent.
-
-    Face detection says *where the head is*; it is intentionally not trusted
-    as the identity of a person from one frame to the next.  This detector
-    supplies that stable, full-body anchor.  It is run only on keyframes.
-    """
+    """Return a CPU person detector using tiling and full-frame analysis."""
     if not model.exists() or not model.with_suffix(".bin").exists():
         return None
     try:
@@ -120,86 +146,70 @@ def openvino_person_detector(model: Path, cv2, np):
     except Exception:
         return None
 
-    def detect(frame):
+    def detect(frame, conf_threshold=0.35):
         height, width = frame.shape[:2]
-        resized = cv2.resize(frame, (input_width, input_height))
-        blob = np.ascontiguousarray(resized.transpose(2, 0, 1)[None])
-        result = compiled({input_layer: blob})[output_layer].reshape(-1, 7)
+        tile_size, tile_step = 640, 512
+        x_starts = list(range(0, max(1, width - tile_size + 1), tile_step))
+        y_starts = list(range(0, max(1, height - tile_size + 1), tile_step))
+        if x_starts[-1] != max(0, width - tile_size):
+            x_starts.append(max(0, width - tile_size))
+        if y_starts[-1] != max(0, height - tile_size):
+            y_starts.append(max(0, height - tile_size))
+
         boxes, scores = [], []
-        for _, label, confidence, x1, y1, x2, y2 in result:
-            # This Open Model Zoo model is single-class: person is label 0.
-            if int(label) != 0 or confidence < 0.55:
-                continue
-            left, top = max(0, x1 * width), max(0, y1 * height)
-            right, bottom = min(width, x2 * width), min(height, y2 * height)
-            if right - left >= 24 and bottom - top >= 36:
-                boxes.append([left, top, right - left, bottom - top])
-                scores.append(float(confidence))
-        kept = cv2.dnn.NMSBoxes(boxes, scores, 0.55, 0.40) if boxes else []
-        people = []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        for index in kept:
-            x, y, box_width, box_height = boxes[int(index)]
-            region = gray[int(y):int(y + box_height), int(x):int(x + box_width)]
-            points = cv2.goodFeaturesToTrack(region, maxCorners=32, qualityLevel=0.008,
-                                              minDistance=7, blockSize=7)
-            if points is None:
-                points = np.array([[x + box_width / 2, y + box_height / 2]], dtype="float32")
-            else:
-                points = points.reshape(-1, 2) + np.array([x, y], dtype="float32")
-            people.append(([x, y, box_width, box_height], points.astype("float32")))
-        return people
+        # Native resolution tiles for small / seated people
+        for top in y_starts:
+            for left in x_starts:
+                tile = frame[top:min(height, top + tile_size), left:min(width, left + tile_size)]
+                tile_height, tile_width = tile.shape[:2]
+                resized = cv2.resize(tile, (input_width, input_height))
+                blob = np.ascontiguousarray(resized.transpose(2, 0, 1)[None])
+                result = compiled({input_layer: blob})[output_layer].reshape(-1, 7)
+                for _, label, confidence, x1, y1, x2, y2 in result:
+                    if int(label) == 0 and confidence >= conf_threshold:
+                        bx = left + max(0, int(x1 * tile_width))
+                        by = top + max(0, int(y1 * tile_height))
+                        bw = int((x2 - x1) * tile_width)
+                        bh = int((y2 - y1) * tile_height)
+                        if bw >= 20 and bh >= 30:
+                            boxes.append([bx, by, bw, bh])
+                            scores.append(float(confidence))
+
+        # Full-frame pass for large / nearby people
+        resized_full = cv2.resize(frame, (input_width, input_height))
+        blob_full = np.ascontiguousarray(resized_full.transpose(2, 0, 1)[None])
+        res_full = compiled({input_layer: blob_full})[output_layer].reshape(-1, 7)
+        for _, label, confidence, x1, y1, x2, y2 in res_full:
+            if int(label) == 0 and confidence >= conf_threshold:
+                bx = max(0, int(x1 * width))
+                by = max(0, int(y1 * height))
+                bw = int((x2 - x1) * width)
+                bh = int((y2 - y1) * height)
+                if bw >= 20 and bh >= 30:
+                    boxes.append([bx, by, bw, bh])
+                    scores.append(float(confidence))
+
+        kept = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.40) if boxes else []
+        return [(boxes[int(i)], scores[int(i)]) for i in (kept.flatten() if len(kept) > 0 else [])]
 
     return detect
 
 
-def openvino_head_pose_estimator(model: Path, cv2, np):
-    """Estimate a head from facial keypoints inside one detected person."""
-    if not model.exists() or not model.with_suffix(".bin").exists():
+def extract_torso_appearance(frame, head_box, cv2, np):
+    """Compute an HSV color histogram of the torso/clothing area directly below the head."""
+    height, width = frame.shape[:2]
+    hx, hy, hw, hh = head_box
+    tx = max(0, int(hx - 0.25 * hw))
+    ty = min(height - 1, int(hy + hh * 0.75))
+    tw = min(width - tx, int(hw * 1.5))
+    th = min(height - ty, int(hh * 1.6))
+    if tw < 8 or th < 8:
         return None
-    try:
-        from openvino import Core
-        compiled = Core().compile_model(str(model), "CPU")
-        input_layer = compiled.input(0)
-        _, _, input_height, input_width = (int(value) for value in input_layer.shape)
-        heatmap_output = next(output for output in compiled.outputs if int(output.shape[1]) == 19)
-    except Exception:
-        return None
-
-    def estimate(frame, person_box):
-        frame_height, frame_width = frame.shape[:2]
-        x, y, box_width, box_height = person_box
-        left = max(0, int(x - box_width * 0.18))
-        top = max(0, int(y - box_height * 0.18))
-        right = min(frame_width, int(x + box_width * 1.18))
-        bottom = min(frame_height, int(y + box_height * 1.05))
-        if right - left < 16 or bottom - top < 16:
-            return None
-        crop = frame[top:bottom, left:right]
-        resized = cv2.resize(crop, (input_width, input_height))
-        blob = np.ascontiguousarray(resized.transpose(2, 0, 1)[None])
-        heatmaps = compiled({input_layer: blob})[heatmap_output][0]
-        map_height, map_width = heatmaps.shape[1:]
-        points = []
-        # COCO/OpenPose: nose, right/left eye, right/left ear.
-        for joint in (0, 14, 15, 16, 17):
-            heatmap = heatmaps[joint]
-            row, column = np.unravel_index(np.argmax(heatmap), heatmap.shape)
-            score = float(heatmap[row, column])
-            if score >= 0.12:
-                points.append((left + (column + 0.5) * (right - left) / map_width,
-                               top + (row + 0.5) * (bottom - top) / map_height))
-        if not points:
-            return None
-        xs, ys = zip(*points)
-        center_x, center_y = sum(xs) / len(xs), sum(ys) / len(ys)
-        spread = max(xs) - min(xs) if len(xs) > 1 else 0
-        head_width = max(28, min(box_width * 0.62, max(spread * 2.4, box_width * 0.30)))
-        head_height = max(32, min(box_height * 0.34, head_width * 1.15))
-        return [center_x - head_width / 2, center_y - head_height * 0.48,
-                head_width, head_height]
-
-    return estimate
+    torso_crop = frame[ty:ty + th, tx:tx + tw]
+    hsv = cv2.cvtColor(torso_crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    return hist
 
 
 @dataclass(frozen=True)
@@ -490,38 +500,21 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
         capture.release()
         raise ArchiveError("Nagranie nie zawiera prawidłowego obrazu do anonimizacji.")
 
-    def estimated_head(person_box):
-        """Conservative head silhouette derived from a detected person box.
+    models_dir = Path(__file__).resolve().parent / "models"
+    yolo_detector = openvino_yolo_head_detector(models_dir / "yolov8n-head.onnx", cv2, np)
+    person_detector = openvino_person_detector(models_dir / "person-detection-0202.xml", cv2, np)
+    intel_detector = openvino_face_detector(models_dir / "face-detection-retail-0004.xml", cv2, np)
+    adas_detector = openvino_face_detector(models_dir / "face-detection-adas-0001.xml", cv2, np)
 
-        This is used only when the person model positively sees a person but
-        their face is turned away, covered, or too small for the face model.
-        It intentionally covers hair and ears as well as the face.
-        """
-        x, y, person_width, person_height = person_box
-        head_width = max(28, min(person_width * 0.70, 220))
-        head_height = max(32, min(person_height * 0.30, head_width * 1.15, 250))
-        return [x + (person_width - head_width) / 2, y - head_height * 0.06,
-                head_width, head_height]
+    yunet = None
+    yunet_model = models_dir / "face_detection_yunet_2023mar.onnx"
+    if yunet_model.exists() and hasattr(cv2, "FaceDetectorYN"):
+        yunet = cv2.FaceDetectorYN.create(str(yunet_model), "", (width, height), 0.30, 0.20, 5000)
 
-    def head_from_relative(person_box, relative):
-        x, y, person_width, person_height = person_box
-        rel_x, rel_y, rel_width, rel_height = relative
-        return [x + rel_x * person_width, y + rel_y * person_height,
-                max(10, rel_width * person_width), max(10, rel_height * person_height)]
-    # The source archive is passed to this detector at its native resolution.
-    # Lower-quality previews are never used as anonymization input.
-    intel_detector = openvino_face_detector(
-        Path(__file__).resolve().parent / "models" / "face-detection-retail-0004.xml", cv2, np)
-    adas_detector = openvino_face_detector(
-        Path(__file__).resolve().parent / "models" / "face-detection-adas-0001.xml", cv2, np)
-    detector = None
-    model = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2023mar.onnx"
-    if model.exists() and hasattr(cv2, "FaceDetectorYN"):
-        detector = cv2.FaceDetectorYN.create(str(model), "", (width, height), 0.30, 0.20, 5000)
-    if not intel_detector and detector is None:
-        if not model.exists() or not hasattr(cv2, "FaceDetectorYN"):
-            capture.release()
-            raise ArchiveError("Nie można uruchomić modelu wykrywania twarzy dla anonimizacji.")
+    if not yolo_detector and not person_detector and not intel_detector and not adas_detector and yunet is None:
+        capture.release()
+        raise ArchiveError("Nie można uruchomić modeli detekcji dla anonimizacji.")
+
     binary = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
     if not binary:
         capture.release()
@@ -535,116 +528,163 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
     arguments.append(str(target))
     process = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE)
+
     try:
-        keyframe_interval = max(4, min(120, int(os.environ.get("ARCHIVE_ANONYMIZE_KEYFRAME_INTERVAL", "12"))))
+        detection_interval = max(1, min(30, int(os.environ.get("ARCHIVE_ANONYMIZE_INTERVAL", "2"))))
     except ValueError:
-        keyframe_interval = 12
+        detection_interval = 2
+
+    max_hold_frames = max(10, min(150, int(fps * 2.0)))
     frame_number = 0
-    # A track belongs to a person, not to a transient face detection.  Its
-    # ``head_box`` is populated only by a real face detector and remains set
-    # while the person remains in the frame.  This is the important privacy
-    # rule: a missed face in one keyframe must never reveal a known head.
     tracks = []
+    def detect_frame_candidates(frame):
+        # 1. Direct head detections
+        direct_heads = list(yolo_detector(frame)) if yolo_detector else []
+
+        # 2. Supplementary face detections
+        face_boxes = []
+        if intel_detector:
+            face_boxes.extend(intel_detector(frame))
+        if adas_detector:
+            face_boxes.extend(adas_detector(frame))
+        if yunet:
+            yn_out = yunet.detect(frame)[1]
+            if yn_out is not None:
+                for face in yn_out:
+                    face_boxes.append(([int(face[0]), int(face[1]), int(face[2]), int(face[3])], float(face[-1])))
+
+        # 3. Person silhouette detections
+        people = list(person_detector(frame)) if person_detector else []
+
+        candidates = []
+        claimed_heads = set()
+
+        # For every detected person, align to a head or estimate head position from posture
+        for (px, py, pw, ph), p_conf in people:
+            matched_head, matched_idx = None, None
+            for idx, ((hx, hy, hw, hh), h_conf) in enumerate(direct_heads):
+                if idx in claimed_heads:
+                    continue
+                hcx, hcy = hx + hw / 2, hy + hh / 2
+                if px - pw * 0.15 <= hcx <= px + pw * 1.15 and py - ph * 0.20 <= hcy <= py + ph * 0.65:
+                    matched_head = [hx, hy, hw, hh]
+                    matched_idx = idx
+                    break
+
+            if matched_head is None:
+                # Check face detections
+                for (fx, fy, fw, fh), f_conf in face_boxes:
+                    fcx, fcy = fx + fw / 2, fy + fh / 2
+                    if px - pw * 0.15 <= fcx <= px + pw * 1.15 and py - ph * 0.20 <= fcy <= py + ph * 0.65:
+                        matched_head = [fx, fy, fw, fh]
+                        break
+
+            if matched_head is not None:
+                if matched_idx is not None:
+                    claimed_heads.add(matched_idx)
+                candidates.append((matched_head, 0.85))
+            else:
+                # Conservative head derived from upper body posture
+                hw = max(16, int(pw * 0.48))
+                hh = max(18, int(ph * 0.35))
+                hx = int(px + (pw - hw) / 2)
+                hy = max(0, int(py - hh * 0.05))
+                candidates.append(([hx, hy, hw, hh], float(p_conf)))
+
+        # Also keep any unattached direct heads or faces with strong confidence
+        for idx, ((hx, hy, hw, hh), h_conf) in enumerate(direct_heads):
+            if idx not in claimed_heads and h_conf >= 0.30:
+                candidates.append(([hx, hy, hw, hh], float(h_conf)))
+
+        for (fx, fy, fw, fh), f_conf in face_boxes:
+            if f_conf >= 0.45:
+                candidates.append(([fx, fy, fw, fh], float(f_conf)))
+
+        if not candidates:
+            return []
+
+        c_boxes = [c[0] for c in candidates]
+        c_scores = [c[1] for c in candidates]
+        kept = cv2.dnn.NMSBoxes(c_boxes, c_scores, 0.20, 0.40)
+        return [c_boxes[int(i)] for i in (kept.flatten() if len(kept) > 0 else [])]
+
     try:
         while True:
             ok, frame = capture.read()
             if not ok:
                 break
-            # The person model is deliberately evaluated for every frame.
-            # OpenCV optical flow was attracted to chairs and desk edges, so
-            # it could leave a black box behind after a person walked away.
-            # A positive silhouette is now required for every rendered mask.
-            face_candidates = []
-            if True:
-                detected = detector.detect(frame)[1] if detector else None
-                faces = list(intel_detector(frame)) if intel_detector else []
-                if adas_detector:
-                    faces.extend(adas_detector(frame))
-                if detected is not None:
-                    faces.extend((face[:4], face[4:14].reshape(5, 2).astype("float32")) for face in detected)
-                for box, landmarks in faces:
-                    x, y, face_width, face_height = box
-                    ratio = face_width / max(face_height, 1)
-                    if 10 <= face_width <= 360 and 10 <= face_height <= 360 and 0.40 <= ratio <= 2.2:
-                        face_candidates.append(([x, y, face_width, face_height], landmarks))
-            # A mask is based exclusively on a face/head detected in this
-            # exact frame.  Inferring it from a whole person box produced
-            # persistent masks on chairs and in empty areas.
-            people = [(box, points) for box, points in face_candidates]
 
-            # Associate detections to people already in the scene.  A person
-            # is never retained without a current silhouette detection.
-            matched, refreshed = set(), []
-            for box, points in people:
-                x, y, person_width, person_height = box
-                center_x, center_y = x + person_width / 2, y + person_height / 2
-                best_index, best_distance = None, float("inf")
-                for index, old_track in enumerate(tracks):
-                    if index in matched:
+            is_detection_frame = (frame_number % detection_interval == 0)
+            detections = detect_frame_candidates(frame) if is_detection_frame else []
+
+            matched_tracks = set()
+            matched_dets = set()
+
+            # Associate detections to existing tracks
+            for d_idx, d_box in enumerate(detections):
+                dx, dy, dw, dh = d_box
+                dcx, dcy = dx + dw / 2, dy + dh / 2
+                best_t, best_dist = None, float("inf")
+                for t_idx, track in enumerate(tracks):
+                    if t_idx in matched_tracks:
                         continue
-                    ox, oy, ow, oh = old_track["box"]
-                    distance = ((center_x - (ox + ow / 2)) ** 2 + (center_y - (oy + oh / 2)) ** 2) ** 0.5
-                    if distance < best_distance and distance <= max(person_width, person_height, ow, oh) * 0.75:
-                        best_index, best_distance = index, distance
-                if best_index is None:
-                    refreshed.append({"box": box, "points": points,
-                                      "head_box": estimated_head(box), "head_is_measured": False})
-                else:
-                    track = tracks[best_index]
-                    track.update(box=box, points=points)
-                    if track.get("head_is_measured", False) and track.get("head_relative") is not None:
-                        track["head_box"] = head_from_relative(box, track["head_relative"])
-                    else:
-                        track["head_box"] = estimated_head(box)
-                    refreshed.append(track)
-                    matched.add(best_index)
-            # Attach a measured head to the corresponding current silhouette.
-            # A measurement is stored in silhouette-relative coordinates, so
-            # every next frame moves the head with the newly detected person.
-            for face_box, _ in face_candidates:
-                fx, fy, fw, fh = face_box
-                face_center_x, face_center_y = fx + fw / 2, fy + fh / 2
-                owner, owner_distance = None, float("inf")
-                for track in refreshed:
-                    px, py, pw, ph = track["box"]
-                    if not (px - pw * 0.15 <= face_center_x <= px + pw * 1.15
-                            and py - ph * 0.30 <= face_center_y <= py + ph * 0.70):
-                        continue
-                    distance = abs(face_center_x - (px + pw / 2)) + abs(face_center_y - py)
-                    if distance < owner_distance:
-                        owner, owner_distance = track, distance
-                if owner is not None:
-                    px, py, pw, ph = owner["box"]
-                    owner["head_box"] = face_box
-                    owner["head_relative"] = [(face_box[0] - px) / max(pw, 1),
-                                              (face_box[1] - py) / max(ph, 1),
-                                              face_box[2] / max(pw, 1), face_box[3] / max(ph, 1)]
-                    owner["head_is_measured"] = True
-            tracks = refreshed
-            for track in tracks:
-                if track["head_box"] is None:
+                    tx, ty, tw, th = track["box"]
+                    tcx, tcy = tx + tw / 2, ty + th / 2
+                    dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
+                    max_allowed = max(dw, dh, tw, th) * 1.3
+                    if dist < best_dist and dist <= max_allowed:
+                        best_t, best_dist = t_idx, dist
+                if best_t is not None:
+                    matched_tracks.add(best_t)
+                    matched_dets.add(d_idx)
+                    track = tracks[best_t]
+                    track["box"] = d_box
+                    track["missed"] = 0
+                    new_hist = extract_torso_appearance(frame, d_box, cv2, np)
+                    if new_hist is not None:
+                        if track.get("torso_hist") is None:
+                            track["torso_hist"] = new_hist
+                        else:
+                            track["torso_hist"] = 0.80 * track["torso_hist"] + 0.20 * new_hist
+
+            # Initialize new tracks for unmatched detections
+            for d_idx, d_box in enumerate(detections):
+                if d_idx not in matched_dets:
+                    hist = extract_torso_appearance(frame, d_box, cv2, np)
+                    tracks.append({"box": d_box, "torso_hist": hist, "missed": 0})
+
+            # Check tracks not updated by detection
+            surviving = []
+            for t_idx, track in enumerate(tracks):
+                if is_detection_frame and t_idx in matched_tracks:
+                    surviving.append(track)
                     continue
-                x, y, face_width, face_height = track["head_box"]
-                if track.get("head_is_measured", False):
-                    # Cover the whole head (hair, ears, jaw), not merely the
-                    # face rectangle supplied by the detector.
-                    pad_x = max(10, int(face_width * 0.8))
-                    pad_top, pad_bottom = max(10, int(face_height)), max(10, int(face_height * 0.6))
-                    mask_width = min(220, int(face_width + 2 * pad_x))
-                    mask_height = min(250, int(face_height + pad_top + pad_bottom))
-                    center_x = x + face_width / 2
-                    center_y = y + face_height / 2 - face_height * 0.12
-                else:
-                    # ``head_box`` is already a deliberately enlarged head
-                    # silhouette estimated from the person box.  Padding it a
-                    # second time was the cause of person-sized black blocks.
-                    mask_width = min(220, int(face_width * 1.10))
-                    mask_height = min(250, int(face_height * 1.10))
-                    center_x, center_y = x + face_width / 2, y + face_height / 2
-                left = max(0, round(center_x - mask_width / 2))
-                top = max(0, round(center_y - mask_height / 2))
-                right = min(width, left + mask_width)
-                bottom = min(height, top + mask_height)
+
+                track["missed"] += 1
+                if track["missed"] > max_hold_frames:
+                    continue
+
+                # Verify that the torso/clothing is still present under the head
+                cur_hist = extract_torso_appearance(frame, track["box"], cv2, np)
+                if cur_hist is not None and track.get("torso_hist") is not None:
+                    corr = cv2.compareHist(cur_hist, track["torso_hist"], cv2.HISTCMP_CORREL)
+                    if corr < 0.45:
+                        # Person moved or left; do not keep ghost mask on empty chair/background
+                        continue
+
+                surviving.append(track)
+
+            tracks = surviving
+
+            # Render solid black masks covering heads and immediate contours
+            for track in tracks:
+                bx, by, bw, bh = track["box"]
+                pad_x = max(6, int(bw * 0.16))
+                pad_y = max(6, int(bh * 0.18))
+                left = max(0, bx - pad_x)
+                top = max(0, by - pad_y)
+                right = min(width, bx + bw + pad_x)
+                bottom = min(height, by + bh + pad_y)
                 frame[top:bottom, left:right] = 0
             process.stdin.write(frame.tobytes())
             frame_number += 1

@@ -91,32 +91,27 @@ MP4 w jakości oryginalnej zachowuje HEVC, jeśli taki jest kodek kamery; zgodno
 odtwarzacza wymaga wtedy HEVC. Profile przetwarzane używają H.264. Limit czasu
 ich konwersji ustawia ARCHIVE_CONVERT_TIMEOUT (domyślnie 3600 s).
 
-Opcja **Anonimowość** zasłania czarną maską całą wykrytą głowę, zanim plik trafi
-do przeglądarki. Detekcja działa lokalnie na CPU modelem Intel Open Model Zoo
-`face-detection-retail-0004`. Obraz CCTV jest analizowany nakładającymi się
-kaflami w pełnej skali, a duplikaty są odrzucane jednym wspólnym NMS; nie
-używa kaskad Haar, ponieważ dają one fałszywe trafienia na meblach i tablicach.
-Jest zapamiętywana oddzielnie w każdej
-przeglądarce, dotyczy pliku i zakresu oraz zawsze koduje wynik do H.264 — także
-gdy wybrano jakość „oryginał”. Detekcja jest automatyczna, dlatego przed
-udostępnieniem materiału warto sprawdzić gotowy plik; przy włączonej opcji
-oryginalne, niezamaskowane nagranie nie jest wysyłane do klienta.
-
-Eksport anonimowy jest ponownie kodowany profilem nastawionym na szybkość;
-rozmiar gotowego pliku może być większy niż źródła. Detektor nie zastępuje
-kontroli gotowego materiału w sytuacjach, w których wymagana jest bezwzględna
-anonimizacja każdej osoby (np. twarze zasłonięte, odwrócone lub bardzo małe).
-Liczba wątków jest dobierana automatycznie na podstawie rdzeni przydzielonych
-kontenerowi i liczby równoległych eksportów (`ARCHIVE_MAX_CONCURRENT_JOBS`,
-domyślnie 2), z limitem 8 wątków na eksport. Ustaw zmienną
-`ARCHIVE_ANONYMIZE_THREADS` na liczbę, aby ręcznie to nadpisać.
-Model osób Intel Open Model Zoo `person-detection-0202` jest sprawdzany w
-każdej klatce, a detektor twarzy doprecyzowuje maskę głowy. Położenie maski jest
-zatem wyliczane z bieżącej sylwetki i nie zostaje na krześle ani tle po wyjściu
-człowieka. Gdy twarz jest odwrócona lub na chwilę zasłonięta, maskowana jest
-ograniczona górna część aktualnie potwierdzonej sylwetki.
-`ARCHIVE_ANONYMIZE_KEYFRAME_INTERVAL` określa odstęp detekcji twarzy
-(domyślnie 12); mniejsza wartość szybciej doprecyzowuje maskę, ale wydłuża eksport.
+Opcja **Anonimowość** zasłania czarną maską całą głowę każdej wykrytej osoby, zanim plik trafi
+do przeglądarki. Architektura łączy trzystopniową detekcję i śledzenie sylwetki:
+- **Detektor głów (Head Detector)**: model YOLOv8 `yolov8n-head.onnx` wytrenowany na zbiorze SCUT-HEAD.
+  Działa na pełnej rozdzielczości CCTV w nakładających się kaflach 640×640. Wykrywa głowy pod dowolnym kątem,
+  w tym ujęcia sufitowe, osoby odwrócone tyłem lub z pochyloną głową (włosy, czapki, kark).
+- **Detektor sylwetek osób (Person Detector)**: model Intel OpenVINO `person-detection-0202` analizuje
+  zarówno całą klatkę, jak i natywne kafle, lokalizując całe ciała osób siedzących i stojących. W przypadku
+  gdy głowa jest silnie zasłonięta lub pochylona nad blatem/telefonem, pozycja głowy jest precyzyjnie
+  szacowana z górnej części potwierdzonej postury.
+- **Detektory twarzy (Face Detectors)**: Intel Open Model Zoo (`face-detection-retail-0004`,
+  `face-detection-adas-0001`) oraz OpenCV YuNet stanowią warstwę pomocniczą weryfikującą obecność twarzy.
+- **Śledzenie i weryfikacja ubioru (Appearance Tracking)**: pod każdą wykrytą głową wyliczany jest
+  profil kolorystyczny ubioru w przestrzeni HSV. W klatkach pośrednich oraz przy chwilowej utracie
+  detekcji samej głowy, maska jest stabilnie podtrzymywana na podstawie obecności ciała i zgodności
+  koloru ubrania. Po odejściu człowieka korelacja tła spada i maska natychmiast znika, eliminując
+  „duchy” masek na pustych krzesłach.
+- `ARCHIVE_ANONYMIZE_INTERVAL` określa odstęp pełnej detekcji w klatkach (domyślnie 2).
+  Każda klatka wyjściowa otrzymuje wyliczoną maskę.
+- Liczba wątków jest dobierana automatycznie na podstawie rdzeni przydzielonych kontenerowi
+  i liczby równoległych eksportów (`ARCHIVE_MAX_CONCURRENT_JOBS`, domyślnie 2). Ustaw zmienną
+  `ARCHIVE_ANONYMIZE_THREADS`, aby ręcznie to nadpisać.
 
 Maska obejmuje całą głowę, nie tylko prostokąt twarzy. Wykryte osoby są
 kojarzone między kolejnymi klatkami, ale narysowanie maski zawsze wymaga bieżącej
