@@ -83,9 +83,13 @@ Brak tych możliwości jest wyświetlany w Ustawieniach i blokuje pobranie zamia
 wybierać inne miejsce bez wiedzy użytkownika. Samodzielne wskazanie folderu
 w natywnym oknie musi wykonać użytkownik; nie ustawiamy arbitralnej ścieżki.
 
-Format AVI/MP4 i jakość dotyczą każdego nowego pobrania, pliku i zakresu:
+Format AVI/MP4, jakość oraz klatkaż dotyczą każdego nowego pobrania, pliku i zakresu:
 - oryginał: kopiowanie źródłowego H.264/HEVC, bez ponownej kompresji;
-- 1080p, 720p, 480p: H.264 z limitem wysokości, bez powiększania źródła.
+- 1080p, 720p, 480p: H.264 z limitem wysokości, bez powiększania źródła;
+- **Liczba klatek (płynność)**:
+  - Oryginalna (np. 25 kl./s z kamery);
+  - Zmniejszona (15 kl./s) — zalecana przy anonimizacji: zmniejsza rozmiar pliku o ~40% i skraca czas analizy sieci neuronowych niemal 2.5-krotnie, zachowując płynny ruch monitoringu;
+  - Oszczędna (10 kl./s) — maksymalna redukcja wagi pliku i czasu przetwarzania.
 
 MP4 w jakości oryginalnej zachowuje HEVC, jeśli taki jest kodek kamery; zgodność
 odtwarzacza wymaga wtedy HEVC. Profile przetwarzane używają H.264. Limit czasu
@@ -105,10 +109,19 @@ do przeglądarki. Architektura łączy trzystopniową detekcję i śledzenie syl
 - **Śledzenie i weryfikacja ubioru (Appearance Tracking)**: pod każdą wykrytą głową wyliczany jest
   profil kolorystyczny ubioru w przestrzeni HSV. W klatkach pośrednich oraz przy chwilowej utracie
   detekcji samej głowy, maska jest stabilnie podtrzymywana na podstawie obecności ciała i zgodności
-  koloru ubrania. Po odejściu człowieka korelacja tła spada i maska natychmiast znika, eliminując
+  koloru ubrania (do 3.5 sekundy dla osób stacjonarnych). Po odejściu człowieka korelacja tła spada i maska natychmiast znika, eliminując
   „duchy” masek na pustych krzesłach.
-- `ARCHIVE_ANONYMIZE_INTERVAL` określa odstęp pełnej detekcji w klatkach (domyślnie 2).
-  Każda klatka wyjściowa otrzymuje wyliczoną maskę.
+- **Dwukierunkowy bufor lookahead i interpolacja przerw (Temporal Gap Smoother / Post-sprawdzacz)**:
+  strumień klatek przepływa przez okno wyprzedzające (sliding lookahead buffer, domyślnie 45 klatek = 3.0 s,
+  konfigurowane zmienną `ARCHIVE_ANONYMIZE_LOOKAHEAD`). Jeśli dana osoba posiada potwierdzoną maskę
+  w klatce $A$ oraz w klatce $C$, to w dowolnej pośredniej klatce $B$ maska jest automatycznie i płynnie
+  interpolowana liniowo (dla osób stacjonarnych mostkowanie sięga do 6 sekund). Całkowicie eliminuje to
+  pojedyncze mignięcia lub chwilowe zaniki masek podczas gwałtownych ruchów, pochyleń czy zasłonięcia.
+- **Wektoryzacja i zoptymalizowana geometria kafli (Covering Tiles)**:
+  kafelkowanie 640×640 wyznacza minimalną siatkę bez nadmiarowego nakładania się (4 kafle dla 720p zamiast 6 z 80% duplikatami),
+  a parsowanie 8400 predykcji tensora wyjściowego YOLO zostało w pełni zwektoryzowane w NumPy (czas parsowania kafelka zredukowany z 23 ms do 0.01 ms).
+- `ARCHIVE_ANONYMIZE_INTERVAL` określa odstęp pełnej detekcji w klatkach (domyślnie 5 klatek dla $\le 18$ kl./s, 3 dla wyższych).
+  Każda klatka wyjściowa otrzymuje wyliczoną lub interpolowaną maskę.
 - Liczba wątków jest dobierana automatycznie na podstawie rdzeni przydzielonych kontenerowi
   i liczby równoległych eksportów (`ARCHIVE_MAX_CONCURRENT_JOBS`, domyślnie 2). Ustaw zmienną
   `ARCHIVE_ANONYMIZE_THREADS`, aby ręcznie to nadpisać.

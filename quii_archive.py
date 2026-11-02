@@ -44,6 +44,19 @@ def anonymize_worker_count() -> int:
     return max(1, min(8, (available + concurrent_jobs - 1) // concurrent_jobs))
 
 
+def compute_covering_tiles(width, height, tile_size=640):
+    """Return minimal start coordinates that cover the entire frame without excessive tile overlap."""
+    x_starts = [0]
+    while x_starts[-1] + tile_size < width:
+        x_starts.append(min(width - tile_size, x_starts[-1] + tile_size))
+    x_starts = sorted(list(set(x_starts)))
+    y_starts = [0]
+    while y_starts[-1] + tile_size < height:
+        y_starts.append(min(height - tile_size, y_starts[-1] + tile_size))
+    y_starts = sorted(list(set(y_starts)))
+    return x_starts, y_starts
+
+
 def openvino_yolo_head_detector(model: Path, cv2, np):
     """Return a YOLOv8 head detector using OpenVINO CPU inference, or None."""
     if not model.exists():
@@ -57,18 +70,12 @@ def openvino_yolo_head_detector(model: Path, cv2, np):
 
     def detect(frame, conf_threshold=0.20):
         height, width = frame.shape[:2]
-        tile_size, tile_step = 640, 512
-        x_starts = list(range(0, max(1, width - tile_size + 1), tile_step))
-        y_starts = list(range(0, max(1, height - tile_size + 1), tile_step))
-        if x_starts[-1] != max(0, width - tile_size):
-            x_starts.append(max(0, width - tile_size))
-        if y_starts[-1] != max(0, height - tile_size):
-            y_starts.append(max(0, height - tile_size))
+        x_starts, y_starts = compute_covering_tiles(width, height, 640)
 
         boxes, scores = [], []
         for top in y_starts:
             for left in x_starts:
-                tile = frame[top:min(height, top + tile_size), left:min(width, left + tile_size)]
+                tile = frame[top:min(height, top + 640), left:min(width, left + 640)]
                 tile_height, tile_width = tile.shape[:2]
                 if tile_height != 640 or tile_width != 640:
                     padded = np.zeros((640, 640, 3), dtype=tile.dtype)
@@ -76,15 +83,19 @@ def openvino_yolo_head_detector(model: Path, cv2, np):
                     tile = padded
                 blob = np.ascontiguousarray((tile.astype(np.float32) / 255.0).transpose(2, 0, 1)[None])
                 preds = compiled({input_layer: blob})[output_layer][0].T
-                for cx, cy, bw, bh, conf in preds:
-                    if conf >= conf_threshold and 0 <= cx < tile_width and 0 <= cy < tile_height:
-                        bx = max(0, int(left + cx - bw / 2))
-                        by = max(0, int(top + cy - bh / 2))
-                        bw_i = min(width - bx, int(bw))
-                        bh_i = min(height - by, int(bh))
-                        if bw_i >= 10 and bh_i >= 10:
-                            boxes.append([bx, by, bw_i, bh_i])
-                            scores.append(float(conf))
+                mask = preds[:, 4] >= conf_threshold
+                filtered = preds[mask]
+                if len(filtered) > 0:
+                    cx, cy = filtered[:, 0], filtered[:, 1]
+                    bw, bh = filtered[:, 2], filtered[:, 3]
+                    bx = np.maximum(0, (left + cx - bw / 2).astype(np.int32))
+                    by = np.maximum(0, (top + cy - bh / 2).astype(np.int32))
+                    bw_i = np.minimum(width - bx, bw.astype(np.int32))
+                    bh_i = np.minimum(height - by, bh.astype(np.int32))
+                    valid = (bw_i >= 10) & (bh_i >= 10) & (cx >= 0) & (cx < tile_width) & (cy >= 0) & (cy < tile_height)
+                    if np.any(valid):
+                        boxes.extend(np.column_stack([bx[valid], by[valid], bw_i[valid], bh_i[valid]]).tolist())
+                        scores.extend(filtered[valid, 4].tolist())
         kept = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.40) if boxes else []
         return [(boxes[int(i)], scores[int(i)]) for i in (kept.flatten() if len(kept) > 0 else [])]
 
@@ -105,17 +116,11 @@ def openvino_face_detector(model: Path, cv2, np):
 
     def detect(frame, conf_threshold=0.30):
         height, width = frame.shape[:2]
-        tile_size, tile_step = 640, 512
-        x_starts = list(range(0, max(1, width - tile_size + 1), tile_step))
-        y_starts = list(range(0, max(1, height - tile_size + 1), tile_step))
-        if x_starts[-1] != max(0, width - tile_size):
-            x_starts.append(max(0, width - tile_size))
-        if y_starts[-1] != max(0, height - tile_size):
-            y_starts.append(max(0, height - tile_size))
+        x_starts, y_starts = compute_covering_tiles(width, height, 640)
         boxes, scores = [], []
         for top in y_starts:
             for left in x_starts:
-                tile = frame[top:min(height, top + tile_size), left:min(width, left + tile_size)]
+                tile = frame[top:min(height, top + 640), left:min(width, left + 640)]
                 tile_height, tile_width = tile.shape[:2]
                 resized = cv2.resize(tile, (input_width, input_height))
                 blob = np.ascontiguousarray(resized.transpose(2, 0, 1)[None])
@@ -123,10 +128,10 @@ def openvino_face_detector(model: Path, cv2, np):
                 for _, _, confidence, x1, y1, x2, y2 in result:
                     if confidence < conf_threshold:
                         continue
-                    x1, y1 = left + max(0, x1 * tile_width), top + max(0, y1 * tile_height)
-                    x2, y2 = left + min(tile_width, x2 * tile_width), top + min(tile_height, y2 * tile_height)
-                    if x2 - x1 >= 10 and y2 - y1 >= 10:
-                        boxes.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+                    x1_val, y1_val = left + max(0, x1 * tile_width), top + max(0, y1 * tile_height)
+                    x2_val, y2_val = left + min(tile_width, x2 * tile_width), top + min(tile_height, y2 * tile_height)
+                    if x2_val - x1_val >= 10 and y2_val - y1_val >= 10:
+                        boxes.append([int(x1_val), int(y1_val), int(x2_val - x1_val), int(y2_val - y1_val)])
                         scores.append(float(confidence))
         kept = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.35) if boxes else []
         return [(boxes[int(i)], scores[int(i)]) for i in (kept.flatten() if len(kept) > 0 else [])]
@@ -148,19 +153,13 @@ def openvino_person_detector(model: Path, cv2, np):
 
     def detect(frame, conf_threshold=0.35):
         height, width = frame.shape[:2]
-        tile_size, tile_step = 640, 512
-        x_starts = list(range(0, max(1, width - tile_size + 1), tile_step))
-        y_starts = list(range(0, max(1, height - tile_size + 1), tile_step))
-        if x_starts[-1] != max(0, width - tile_size):
-            x_starts.append(max(0, width - tile_size))
-        if y_starts[-1] != max(0, height - tile_size):
-            y_starts.append(max(0, height - tile_size))
+        x_starts, y_starts = compute_covering_tiles(width, height, 640)
 
         boxes, scores = [], []
         # Native resolution tiles for small / seated people
         for top in y_starts:
             for left in x_starts:
-                tile = frame[top:min(height, top + tile_size), left:min(width, left + tile_size)]
+                tile = frame[top:min(height, top + 640), left:min(width, left + 640)]
                 tile_height, tile_width = tile.shape[:2]
                 resized = cv2.resize(tile, (input_width, input_height))
                 blob = np.ascontiguousarray(resized.transpose(2, 0, 1)[None])
@@ -446,7 +445,7 @@ def save_video(ip, port, user, password, selections, target: Path):
     return codec, count / duration, count
 
 
-def convert_video(source: Path, target: Path, codec, fps, preview=False, quality="original", source_is_container=False):
+def convert_video(source: Path, target: Path, codec, fps, preview=False, quality="original", source_is_container=False, target_fps=None):
     if quality not in ("original", "1080p", "720p", "480p"):
         raise ArchiveError("Nieprawidłowy profil jakości nagrania.")
     binary = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
@@ -458,10 +457,16 @@ def convert_video(source: Path, target: Path, codec, fps, preview=False, quality
     else:
         arguments += ["-r", str(fps), "-f", codec, "-i", str(source)]
     arguments += ["-an"]
-    if preview or quality != "original":
-        height = 720 if preview else {"1080p": 1080, "720p": 720, "480p": 480}[quality]
-        arguments += ["-vf", f"scale=w=-2:h='min({height},ih)'", "-c:v", "libx264",
-                      "-preset", "veryfast", "-crf", "24" if preview else "20",
+    if preview or quality != "original" or target_fps:
+        height = 720 if preview else {"1080p": 1080, "720p": 720, "480p": 480}.get(quality)
+        vf_parts = []
+        if height is not None:
+            vf_parts.append(f"scale=w=-2:h='min({height},ih)'")
+        if target_fps:
+            vf_parts.append(f"fps={target_fps}")
+        if vf_parts:
+            arguments += ["-vf", ",".join(vf_parts)]
+        arguments += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24" if preview else "22",
                       "-pix_fmt", "yuv420p"]
     else:
         arguments += ["-c:v", "copy"]
@@ -474,7 +479,7 @@ def convert_video(source: Path, target: Path, codec, fps, preview=False, quality
     arguments += [str(target)]
     try:
         result = subprocess.run(arguments, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                timeout=600 if preview or quality == "original" else
+                                timeout=600 if preview or (quality == "original" and not target_fps) else
                                 int(os.environ.get("ARCHIVE_CONVERT_TIMEOUT", "3600")), check=False)
     except subprocess.TimeoutExpired as exc:
         raise ArchiveError("Przekroczono czas konwersji nagrania.") from exc
@@ -522,7 +527,7 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
     arguments = [binary, "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
     arguments += ["-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{width}x{height}",
                   "-framerate", str(fps), "-i", "pipe:0", "-an"]
-    arguments += ["-c:v", "libx264", "-preset", "superfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+    arguments += ["-c:v", "libx264", "-preset", "superfast", "-crf", "22", "-pix_fmt", "yuv420p"]
     if target.suffix.lower() == ".mp4":
         arguments += ["-movflags", "+faststart"]
     arguments.append(str(target))
@@ -530,13 +535,24 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
                                stderr=subprocess.PIPE)
 
     try:
-        detection_interval = max(1, min(30, int(os.environ.get("ARCHIVE_ANONYMIZE_INTERVAL", "2"))))
+        default_interval = "5" if fps <= 18 else "3"
+        detection_interval = max(1, min(30, int(os.environ.get("ARCHIVE_ANONYMIZE_INTERVAL", default_interval))))
     except ValueError:
-        detection_interval = 2
+        detection_interval = 5 if fps <= 18 else 3
 
-    max_hold_frames = max(10, min(150, int(fps * 2.0)))
+    try:
+        lookahead_window = max(10, min(120, int(os.environ.get("ARCHIVE_ANONYMIZE_LOOKAHEAD", "45"))))
+    except ValueError:
+        lookahead_window = 45
+
+    max_gap = lookahead_window
+    max_hold_frames = max(15, min(120, int(fps * 3.5)))
     frame_number = 0
+    emitted_count = 0
+    buffer = deque()
     tracks = []
+    next_track_id = 1
+
     def detect_frame_candidates(frame):
         # 1. Direct head detections
         direct_heads = list(yolo_detector(frame)) if yolo_detector else []
@@ -561,23 +577,30 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
 
         # For every detected person, align to a head or estimate head position from posture
         for (px, py, pw, ph), p_conf in people:
-            matched_head, matched_idx = None, None
+            expected_hx = px + pw / 2.0
+            expected_hy = py + ph * 0.15
+            matched_head, matched_idx, best_dist = None, None, float("inf")
             for idx, ((hx, hy, hw, hh), h_conf) in enumerate(direct_heads):
                 if idx in claimed_heads:
                     continue
-                hcx, hcy = hx + hw / 2, hy + hh / 2
-                if px - pw * 0.15 <= hcx <= px + pw * 1.15 and py - ph * 0.20 <= hcy <= py + ph * 0.65:
-                    matched_head = [hx, hy, hw, hh]
-                    matched_idx = idx
-                    break
+                hcx, hcy = hx + hw / 2.0, hy + hh / 2.0
+                if px - pw * 0.10 <= hcx <= px + pw * 1.10 and py - ph * 0.10 <= hcy <= py + ph * 0.40:
+                    dist = ((hcx - expected_hx) ** 2 + (hcy - expected_hy) ** 2) ** 0.5
+                    if dist < best_dist:
+                        matched_head = [hx, hy, hw, hh]
+                        matched_idx = idx
+                        best_dist = dist
 
             if matched_head is None:
                 # Check face detections
+                best_face_dist = float("inf")
                 for (fx, fy, fw, fh), f_conf in face_boxes:
-                    fcx, fcy = fx + fw / 2, fy + fh / 2
-                    if px - pw * 0.15 <= fcx <= px + pw * 1.15 and py - ph * 0.20 <= fcy <= py + ph * 0.65:
-                        matched_head = [fx, fy, fw, fh]
-                        break
+                    fcx, fcy = fx + fw / 2.0, fy + fh / 2.0
+                    if px - pw * 0.10 <= fcx <= px + pw * 1.10 and py - ph * 0.10 <= fcy <= py + ph * 0.40:
+                        dist = ((fcx - expected_hx) ** 2 + (fcy - expected_hy) ** 2) ** 0.5
+                        if dist < best_face_dist:
+                            matched_head = [fx, fy, fw, fh]
+                            best_face_dist = dist
 
             if matched_head is not None:
                 if matched_idx is not None:
@@ -593,11 +616,11 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
 
         # Also keep any unattached direct heads or faces with strong confidence
         for idx, ((hx, hy, hw, hh), h_conf) in enumerate(direct_heads):
-            if idx not in claimed_heads and h_conf >= 0.30:
+            if idx not in claimed_heads and h_conf >= 0.25:
                 candidates.append(([hx, hy, hw, hh], float(h_conf)))
 
         for (fx, fy, fw, fh), f_conf in face_boxes:
-            if f_conf >= 0.45:
+            if f_conf >= 0.30:
                 candidates.append(([fx, fy, fw, fh], float(f_conf)))
 
         if not candidates:
@@ -608,6 +631,78 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
         kept = cv2.dnn.NMSBoxes(c_boxes, c_scores, 0.20, 0.40)
         return [c_boxes[int(i)] for i in (kept.flatten() if len(kept) > 0 else [])]
 
+    def emit_buffered_frame():
+        nonlocal emitted_count, tracks
+        target_idx, target_frame = buffer.popleft()
+        masks_to_draw = []
+        prune_before = target_idx - max_gap * 2
+
+        for track in tracks:
+            obs = track["observations"]
+            # Prune ancient observations to conserve memory
+            for k in list(obs.keys()):
+                if k < prune_before:
+                    del obs[k]
+
+            if target_idx in obs:
+                masks_to_draw.append(obs[target_idx])
+                continue
+
+            # Bidirectional gap check: look for nearest past and future observations
+            past_keys = [k for k in obs if k < target_idx]
+            future_keys = [k for k in obs if k > target_idx]
+
+            if past_keys and future_keys:
+                t_prev = max(past_keys)
+                t_next = min(future_keys)
+                b_prev = obs[t_prev]
+                b_next = obs[t_next]
+                # Verify reasonable distance bounds between observations
+                dcx = (b_next[0] + b_next[2] / 2.0) - (b_prev[0] + b_prev[2] / 2.0)
+                dcy = (b_next[1] + b_next[3] / 2.0) - (b_prev[1] + b_prev[3] / 2.0)
+                dist = (dcx * dcx + dcy * dcy) ** 0.5
+                dt = t_next - t_prev
+                is_stationary = dist <= max(b_prev[2], b_prev[3], b_next[2], b_next[3]) * 1.5
+                max_dt = max_gap * 2 if is_stationary else max_gap
+                if dt <= max_dt and dist <= max(b_prev[2], b_prev[3], b_next[2], b_next[3]) * 3.0 + dt * 8.0:
+                    alpha = (target_idx - t_prev) / dt
+                    interp_box = [
+                        int((1.0 - alpha) * b_prev[0] + alpha * b_next[0]),
+                        int((1.0 - alpha) * b_prev[1] + alpha * b_next[1]),
+                        int((1.0 - alpha) * b_prev[2] + alpha * b_next[2]),
+                        int((1.0 - alpha) * b_prev[3] + alpha * b_next[3]),
+                    ]
+                    obs[target_idx] = interp_box
+                    masks_to_draw.append(interp_box)
+                    continue
+
+            if past_keys and not future_keys:
+                t_prev = max(past_keys)
+                if target_idx - t_prev <= max_hold_frames:
+                    cur_hist = extract_torso_appearance(target_frame, obs[t_prev], cv2, np)
+                    if cur_hist is not None and track.get("torso_hist") is not None:
+                        corr = cv2.compareHist(cur_hist, track["torso_hist"], cv2.HISTCMP_CORREL)
+                        if corr >= 0.40:
+                            masks_to_draw.append(obs[t_prev])
+
+        # Retire tracks that have expired past the lookahead horizon
+        tracks = [t for t in tracks if t["last_seen_frame"] >= target_idx - max_gap * 2]
+
+        for bx, by, bw, bh in masks_to_draw:
+            pad_x = max(6, int(bw * 0.16))
+            pad_y = max(6, int(bh * 0.18))
+            left = max(0, bx - pad_x)
+            top = max(0, by - pad_y)
+            right = min(width, bx + bw + pad_x)
+            bottom = min(height, by + bh + pad_y)
+            target_frame[top:bottom, left:right] = 0
+
+        process.stdin.write(target_frame.tobytes())
+        emitted_count += 1
+        if progress_callback and emitted_count % 20 == 0:
+            total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            progress_callback(min(1.0, emitted_count / total_frames) if total_frames > 0 else None)
+
     try:
         while True:
             ok, frame = capture.read()
@@ -617,29 +712,33 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
             is_detection_frame = (frame_number % detection_interval == 0)
             detections = detect_frame_candidates(frame) if is_detection_frame else []
 
-            matched_tracks = set()
-            matched_dets = set()
+            if is_detection_frame and detections:
+                candidate_pairs = []
+                for d_idx, d_box in enumerate(detections):
+                    dx, dy, dw, dh = d_box
+                    dcx, dcy = dx + dw / 2.0, dy + dh / 2.0
+                    for t_idx, track in enumerate(tracks):
+                        tx, ty, tw, th = track["box"]
+                        tcx, tcy = tx + tw / 2.0, ty + th / 2.0
+                        dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
+                        gap = frame_number - track["last_seen_frame"]
+                        max_allowed = max(35.0, max(dw, dh, tw, th) * 1.2) + min(50.0, gap * 4.0)
+                        if dist <= max_allowed:
+                            candidate_pairs.append((dist, d_idx, t_idx))
 
-            # Associate detections to existing tracks
-            for d_idx, d_box in enumerate(detections):
-                dx, dy, dw, dh = d_box
-                dcx, dcy = dx + dw / 2, dy + dh / 2
-                best_t, best_dist = None, float("inf")
-                for t_idx, track in enumerate(tracks):
-                    if t_idx in matched_tracks:
+                candidate_pairs.sort(key=lambda item: item[0])
+                matched_dets = set()
+                matched_tracks = set()
+                for dist, d_idx, t_idx in candidate_pairs:
+                    if d_idx in matched_dets or t_idx in matched_tracks:
                         continue
-                    tx, ty, tw, th = track["box"]
-                    tcx, tcy = tx + tw / 2, ty + th / 2
-                    dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
-                    max_allowed = max(dw, dh, tw, th) * 1.3
-                    if dist < best_dist and dist <= max_allowed:
-                        best_t, best_dist = t_idx, dist
-                if best_t is not None:
-                    matched_tracks.add(best_t)
                     matched_dets.add(d_idx)
-                    track = tracks[best_t]
+                    matched_tracks.add(t_idx)
+                    track = tracks[t_idx]
+                    d_box = detections[d_idx]
                     track["box"] = d_box
-                    track["missed"] = 0
+                    track["last_seen_frame"] = frame_number
+                    track["observations"][frame_number] = d_box
                     new_hist = extract_torso_appearance(frame, d_box, cv2, np)
                     if new_hist is not None:
                         if track.get("torso_hist") is None:
@@ -647,50 +746,32 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
                         else:
                             track["torso_hist"] = 0.80 * track["torso_hist"] + 0.20 * new_hist
 
-            # Initialize new tracks for unmatched detections
-            for d_idx, d_box in enumerate(detections):
-                if d_idx not in matched_dets:
-                    hist = extract_torso_appearance(frame, d_box, cv2, np)
-                    tracks.append({"box": d_box, "torso_hist": hist, "missed": 0})
+                # Initialize new tracks for unmatched detections
+                for d_idx, d_box in enumerate(detections):
+                    if d_idx not in matched_dets:
+                        hist = extract_torso_appearance(frame, d_box, cv2, np)
+                        tracks.append({
+                            "id": next_track_id,
+                            "box": d_box,
+                            "torso_hist": hist,
+                            "last_seen_frame": frame_number,
+                            "observations": {frame_number: d_box},
+                        })
+                        next_track_id += 1
 
-            # Check tracks not updated by detection
-            surviving = []
-            for t_idx, track in enumerate(tracks):
-                if is_detection_frame and t_idx in matched_tracks:
-                    surviving.append(track)
-                    continue
-
-                track["missed"] += 1
-                if track["missed"] > max_hold_frames:
-                    continue
-
-                # Verify that the torso/clothing is still present under the head
-                cur_hist = extract_torso_appearance(frame, track["box"], cv2, np)
-                if cur_hist is not None and track.get("torso_hist") is not None:
-                    corr = cv2.compareHist(cur_hist, track["torso_hist"], cv2.HISTCMP_CORREL)
-                    if corr < 0.45:
-                        # Person moved or left; do not keep ghost mask on empty chair/background
-                        continue
-
-                surviving.append(track)
-
-            tracks = surviving
-
-            # Render solid black masks covering heads and immediate contours
-            for track in tracks:
-                bx, by, bw, bh = track["box"]
-                pad_x = max(6, int(bw * 0.16))
-                pad_y = max(6, int(bh * 0.18))
-                left = max(0, bx - pad_x)
-                top = max(0, by - pad_y)
-                right = min(width, bx + bw + pad_x)
-                bottom = min(height, by + bh + pad_y)
-                frame[top:bottom, left:right] = 0
-            process.stdin.write(frame.tobytes())
+            buffer.append((frame_number, frame))
             frame_number += 1
-            if progress_callback and frame_number % 20 == 0:
-                total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-                progress_callback(frame_number / total_frames if total_frames > 0 else None)
+
+            while len(buffer) > lookahead_window:
+                emit_buffered_frame()
+
+        # End of stream: flush all remaining buffered frames through the smoother
+        while len(buffer) > 0:
+            emit_buffered_frame()
+
+        if progress_callback:
+            progress_callback(1.0)
+
         process.stdin.close()
         process.wait(timeout=int(os.environ.get("ARCHIVE_ANONYMIZE_TIMEOUT", "7200")))
     except (BrokenPipeError, subprocess.TimeoutExpired, OSError) as exc:

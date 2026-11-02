@@ -4,9 +4,9 @@ import { normalizeSettings, suggestedFilename, createUniqueFile, streamToFile } 
 
 test('stored settings reject unknown formats and preserve explicit choices', () => {
     assert.deepEqual(normalizeSettings({ format: 'exe', quality: 'invalid', askEveryTime: 'yes' }),
-        { format: 'avi', quality: 'original', askEveryTime: false, anonymize: false });
-    assert.deepEqual(normalizeSettings({ format: 'mp4', quality: '720p', askEveryTime: true, anonymize: true }),
-        { format: 'mp4', quality: '720p', askEveryTime: true, anonymize: true });
+        { format: 'avi', quality: 'original', fps: 'original', askEveryTime: false, anonymize: false });
+    assert.deepEqual(normalizeSettings({ format: 'mp4', quality: '720p', fps: '15', askEveryTime: true, anonymize: true }),
+        { format: 'mp4', quality: '720p', fps: '15', askEveryTime: true, anonymize: true });
 });
 
 test('suggested filename is portable between Windows and Unix clients', () => {

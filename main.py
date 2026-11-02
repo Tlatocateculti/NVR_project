@@ -400,6 +400,10 @@ def init_db():
     c.execute('''CREATE INDEX IF NOT EXISTS download_jobs_owner_created
                  ON download_jobs(owner_id, created_at DESC)''')
     try:
+        c.execute("ALTER TABLE download_jobs ADD COLUMN fps TEXT NOT NULL DEFAULT 'original'")
+    except sqlite3.OperationalError:
+        pass
+    try:
         c.execute("ALTER TABLE discovery_scan_networks ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
@@ -2205,6 +2209,7 @@ class DownloadJobRequest(BaseModel):
     end_time: str | None = None
     format: Literal["avi", "mp4"] = "avi"
     quality: Literal["original", "1080p", "720p", "480p"] = "original"
+    fps: Literal["original", "15", "10"] = "original"
     anonymize: bool = False
 
 
@@ -2220,7 +2225,7 @@ def job_row(row, now=None):
     now = time_module.time() if now is None else now
     data = dict(zip(("id", "created_at", "started_at", "finished_at", "dvr_id", "dvr_name", "channel",
                      "camera_name", "recording_date", "start_time", "end_time", "filename", "output_format",
-                     "quality", "anonymized", "status", "stage", "progress", "result_name", "error",
+                     "quality", "fps", "anonymized", "status", "stage", "progress", "result_name", "error",
                      "duration_seconds"), row))
     data["anonymized"] = bool(data["anonymized"])
     data["progress"] = round(float(data["progress"]), 1)
@@ -2282,10 +2287,10 @@ class DownloadJobs:
 
     def _run(self, job_id: str):
         with sqlite3.connect("data/dvrs.db") as conn:
-            row = conn.execute("SELECT id, dvr_id, channel, recording_date, filename, start_time, end_time, output_format, quality, anonymized FROM download_jobs WHERE id = ? AND status = 'queued'", (job_id,)).fetchone()
+            row = conn.execute("SELECT id, dvr_id, channel, recording_date, filename, start_time, end_time, output_format, quality, fps, anonymized FROM download_jobs WHERE id = ? AND status = 'queued'", (job_id,)).fetchone()
         if not row:
             return
-        _, dvr_id, channel, date, filename, start_time, end_time, output_format, quality, anonymized = row
+        _, dvr_id, channel, date, filename, start_time, end_time, output_format, quality, fps_choice, anonymized = row
         recorder_lock = self._dvr_lock(dvr_id)
         if not recorder_lock.acquire(blocking=False):
             # A number of NVRs allow only one archive session at a time.
@@ -2310,7 +2315,7 @@ class DownloadJobs:
             acquired = True
             folder, result, result_name = build_queued_recording(
                 dvr_id, channel, date, filename, start_time, end_time, output_format, quality,
-                bool(anonymized), report,
+                fps_choice, bool(anonymized), report,
             )
             update_download_job(job_id, status="ready", stage="Gotowe do pobrania", progress=100,
                                 finished_at=time_module.time(), duration_seconds=time_module.time() - started,
@@ -2332,7 +2337,7 @@ download_jobs = DownloadJobs(ARCHIVE_JOB_LIMIT)
 
 
 def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, preview,
-                      output_format="avi", quality="original", anonymize=False):
+                      output_format="avi", quality="original", fps_choice="original", anonymize=False):
     if output_format not in ("avi", "mp4") or quality not in ("original", "1080p", "720p", "480p"):
         raise HTTPException(status_code=422, detail="Nieprawidłowy format lub jakość nagrania.")
     if channel < 1:
@@ -2387,19 +2392,23 @@ def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, pre
         folder = Path(tempfile.mkdtemp(prefix="recording-", dir=scratch))
         source = folder / "source.video"
         codec, fps, count = save_video(ip, port, user, password, selections, source)
+        target_fps = float(fps_choice) if fps_choice in ("15", "10") else None
+        eff_fps = target_fps if (target_fps and target_fps < fps) else fps
         suffix = "mp4" if preview else output_format
         result = folder / f"recording.{suffix}"
         if anonymize:
-            # Never downscale before detecting faces.  The full recorder
+            # Never downscale before detecting faces. The full recorder
             # archive is wrapped first, then masked, and only then converted
             # to the quality requested for download.
             detector_input = folder / "detector-input.mp4"
-            convert_video(source, detector_input, codec, fps, quality="original")
+            convert_video(source, detector_input, codec, fps, quality="original",
+                          target_fps=target_fps if (target_fps and target_fps < fps) else None)
             masked = folder / "masked.mp4"
             anonymize_faces(detector_input, masked)
-            convert_video(masked, result, "h264", fps, preview=preview, quality=quality, source_is_container=True)
+            convert_video(masked, result, "h264", eff_fps, preview=preview, quality=quality, source_is_container=True)
         else:
-            convert_video(source, result, codec, fps, preview=preview, quality=quality)
+            convert_video(source, result, codec, fps, preview=preview, quality=quality,
+                          target_fps=target_fps if (target_fps and target_fps < fps) else None)
         headers = {"Cache-Control": "no-store", "X-Archive-Audio": "none"}
         if preview:
             headers["X-Preview-Seconds"] = str(round(count / fps, 2))
@@ -2433,7 +2442,7 @@ def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, pre
 
 
 def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time,
-                           output_format, quality, anonymize, report):
+                           output_format, quality, fps_choice, anonymize, report):
     """Prepare one persisted queue item; the worker owns the temporary folder."""
     if output_format not in ("avi", "mp4") or quality not in ("original", "1080p", "720p", "480p"):
         raise HTTPException(status_code=422, detail="Nieprawidłowy format lub jakość nagrania.")
@@ -2477,10 +2486,13 @@ def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time
         source = folder / "source.video"
         report("Pobieranie materiału z rejestratora", 5)
         codec, fps, _ = save_video(ip, port, user, password, selections, source)
+        target_fps = float(fps_choice) if fps_choice in ("15", "10") else None
+        eff_fps = target_fps if (target_fps and target_fps < fps) else fps
         detector_input = folder / "detector-input.mp4"
         if anonymize:
             report("Przygotowanie materiału HQ do anonimizacji", 35)
-            convert_video(source, detector_input, codec, fps, quality="original")
+            convert_video(source, detector_input, codec, fps, quality="original",
+                          target_fps=target_fps if (target_fps and target_fps < fps) else None)
             masked = folder / "masked.mp4"
             report("Wykrywanie i zasłanianie głów", 40)
             anonymize_faces(detector_input, masked,
@@ -2491,8 +2503,9 @@ def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time
             input_file, input_codec = source, codec
             report("Kodowanie pliku wynikowego", 65)
         result = folder / f"recording.{output_format}"
-        convert_video(input_file, result, input_codec, fps, quality=quality,
-                      source_is_container=anonymize)
+        convert_video(input_file, result, input_codec, eff_fps, quality=quality,
+                      source_is_container=anonymize,
+                      target_fps=target_fps if (not anonymize and target_fps and target_fps < fps) else None)
         result_name = (f"nvr-{dvr_id}-kamera-{channel}-{selections[0][1]:%Y-%m-%d_%H-%M-%S}_"
                        f"{selections[-1][2]:%H-%M-%S}.{output_format}")
         return folder, result, result_name
@@ -2507,10 +2520,11 @@ def download_recording(
     start_time: str | None = None, end_time: str | None = None,
     format: Literal["avi", "mp4"] = "avi",
     quality: Literal["original", "1080p", "720p", "480p"] = "original",
+    fps: Literal["original", "15", "10"] = "original",
     anonymize: bool = False,
 ):
     return prepare_recording(dvr_id, channel, date, filename, start_time, end_time, False,
-                             output_format=format, quality=quality, anonymize=anonymize)
+                             output_format=format, quality=quality, fps_choice=fps, anonymize=anonymize)
 
 
 @app.post("/api/download-jobs")
@@ -2531,18 +2545,18 @@ def create_download_job(payload: DownloadJobRequest, request: Request):
         job_id, created = uuid4().hex, time_module.time()
         conn.execute('''INSERT INTO download_jobs
                      (id, owner_id, created_at, dvr_id, dvr_name, channel, camera_name, recording_date,
-                      start_time, end_time, filename, output_format, quality, anonymized, status, stage, progress)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'Oczekuje w kolejce', 0)''',
+                      start_time, end_time, filename, output_format, quality, fps, anonymized, status, stage, progress)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'Oczekuje w kolejce', 0)''',
                      (job_id, owner_id, created, payload.dvr_id, dvr[0], payload.channel, camera_name,
                       payload.date, start_time, end_time, payload.filename, payload.format, payload.quality,
-                      int(payload.anonymize)))
+                      payload.fps, int(payload.anonymize)))
     download_jobs.enqueue(job_id)
     return {"id": job_id, "status": "queued"}
 
 
 def load_owned_job(job_id: str, owner_id: str):
     columns = ("id, created_at, started_at, finished_at, dvr_id, dvr_name, channel, camera_name, recording_date, "
-               "start_time, end_time, filename, output_format, quality, anonymized, status, stage, progress, "
+               "start_time, end_time, filename, output_format, quality, fps, anonymized, status, stage, progress, "
                "result_name, error, duration_seconds")
     with sqlite3.connect("data/dvrs.db") as conn:
         row = conn.execute(f"SELECT {columns} FROM download_jobs WHERE id = ? AND owner_id = ?", (job_id, owner_id)).fetchone()
@@ -2555,7 +2569,7 @@ def load_owned_job(job_id: str, owner_id: str):
 def list_download_jobs(request: Request):
     owner_id = download_owner(request)
     columns = ("id, created_at, started_at, finished_at, dvr_id, dvr_name, channel, camera_name, recording_date, "
-               "start_time, end_time, filename, output_format, quality, anonymized, status, stage, progress, "
+               "start_time, end_time, filename, output_format, quality, fps, anonymized, status, stage, progress, "
                "result_name, error, duration_seconds")
     with sqlite3.connect("data/dvrs.db") as conn:
         rows = conn.execute(f"SELECT {columns} FROM download_jobs WHERE owner_id = ? ORDER BY created_at DESC LIMIT 100", (owner_id,)).fetchall()

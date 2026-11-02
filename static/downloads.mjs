@@ -1,4 +1,4 @@
-const DEFAULTS = Object.freeze({ format: 'avi', quality: 'original', askEveryTime: false, anonymize: false });
+const DEFAULTS = Object.freeze({ format: 'avi', quality: 'original', fps: 'original', askEveryTime: false, anonymize: false });
 const STORAGE_KEY = 'nvr.downloads.v1';
 const FORMATS = { avi: 'video/x-msvideo', mp4: 'video/mp4' };
 
@@ -6,6 +6,7 @@ export function normalizeSettings(value = {}) {
     return {
         format: Object.hasOwn(FORMATS, value?.format) ? value.format : DEFAULTS.format,
         quality: ['original', '1080p', '720p', '480p'].includes(value?.quality) ? value.quality : DEFAULTS.quality,
+        fps: ['original', '15', '10'].includes(value?.fps) ? value.fps : DEFAULTS.fps,
         askEveryTime: value?.askEveryTime === true,
         anonymize: value?.anonymize === true,
     };
@@ -124,6 +125,7 @@ function drawSettings() {
     element('download-ask').checked = settings.askEveryTime;
     element('download-format').value = settings.format;
     element('download-quality').value = settings.quality;
+    if (element('download-fps')) element('download-fps').value = settings.fps || 'original';
     element('download-anonymize').checked = settings.anonymize;
     element('download-format-note').textContent = settings.quality === 'original'
         ? 'Oryginał zachowuje kodek, rozdzielczość i jakość nagrania. MP4 z HEVC wymaga odtwarzacza obsługującego HEVC.'
@@ -141,6 +143,7 @@ function saveSettings() {
     const next = normalizeSettings({
         format: element('download-format').value,
         quality: element('download-quality').value,
+        fps: element('download-fps') ? element('download-fps').value : 'original',
         askEveryTime: element('download-ask').checked,
         anonymize: element('download-anonymize').checked,
     });
@@ -237,7 +240,7 @@ async function requestDownload(params) {
         transferMessage('Dodawanie nagrania do kolejki…');
         const response = await fetch('/api/download-jobs', {
             method: 'POST', cache: 'no-store', headers: downloadHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ ...params, format: selected.format, quality: selected.quality, anonymize: selected.anonymize }),
+            body: JSON.stringify({ ...params, format: selected.format, quality: selected.quality, fps: selected.fps, anonymize: selected.anonymize }),
         });
         if (!response.ok) {
             let message = `Nie udało się pobrać nagrania (${response.status}).`;
@@ -335,7 +338,7 @@ async function initialize() {
             ? 'Ta przeglądarka nie obsługuje wyboru miejsca zapisu. Użyj aktualnego Chrome lub Edge. Nagrania nie będą zapisywane w przypadkowym folderze.'
             : 'Przy dostępie zdalnym wybór folderu wymaga HTTPS. Lokalnie użyj adresu localhost lub 127.0.0.1.';
     }
-    ['download-ask', 'download-format', 'download-quality', 'download-anonymize'].forEach(id => element(id).addEventListener('change', saveSettings));
+    ['download-ask', 'download-format', 'download-quality', 'download-fps', 'download-anonymize'].forEach(id => element(id)?.addEventListener('change', saveSettings));
     element('download-choose-folder').addEventListener('click', async () => {
         try { await chooseDirectory(); } catch (error) {
             if (error.name !== 'AbortError') settingsMessage(error.message || 'Nie udało się wybrać folderu.', true);
