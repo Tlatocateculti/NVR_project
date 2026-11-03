@@ -132,19 +132,72 @@
         .network-remove { margin: 0; padding: 5px 9px; width: auto; color: #ffb4ad; border-color: #83413c; background: #3a2422; }
         .network-remove:hover { background: #572d29; }
 
-        /* Przyciski układu siatki */
-        .grid-buttons {
+        /* Belka wyboru układu siatki kamer na dole widoku Live */
+        #view-live {
             display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+            min-height: 0;
+            overflow: hidden;
             gap: 8px;
         }
-        .grid-buttons button {
-            flex: 1;
-            padding: 8px 0;
-            font-weight: bold;
+        #live-grid {
+            flex: 1 1 0;
+            min-height: 0;
+            width: 100%;
+            display: grid;
+            gap: 8px;
         }
-        .grid-buttons button.active {
-            background: #2196F3;
-            color: white;
+        .live-grid-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 12px;
+            padding: 8px 14px;
+            background: #242424;
+            border: 1px solid #3d3d3d;
+            border-radius: 6px;
+            flex: 0 0 auto;
+            margin-top: auto;
+            user-select: none;
+        }
+        .live-grid-toolbar-label {
+            font-size: 13px;
+            font-weight: bold;
+            color: #ddd;
+            white-space: nowrap;
+        }
+        .live-grid-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 6px;
+        }
+        .live-grid-btn {
+            padding: 5px 11px;
+            font-size: 12px;
+            font-weight: 600;
+            background: #333;
+            color: #ccc;
+            border: 1px solid #484848;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s, color 0.15s;
+        }
+        .live-grid-btn:hover {
+            background: #444;
+            border-color: #666;
+            color: #fff;
+        }
+        .live-grid-btn.active {
+            background: #1976D2;
+            border-color: #2196F3;
+            color: #fff;
+            box-shadow: 0 0 6px rgba(33, 150, 243, 0.4);
+        }
+        body.has-signed-in-user .sidebar {
+            padding-bottom: 75px;
         }
 
         /* Formularz dodawania NVR */
@@ -249,13 +302,20 @@
         /* Widok 1: Siatka kamer Live */
         .video-grid {
             display: grid;
-            gap: 10px;
+            gap: 8px;
             width: 100%;
             height: 100%;
         }
-        .grid-1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
-        .grid-4 { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr); }
-        .grid-16 { grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(4, 1fr); }
+        .grid-1x1 { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+        .grid-2x1 { grid-template-columns: repeat(2, 1fr); grid-template-rows: 1fr; }
+        .grid-2x2 { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(2, 1fr); }
+        .grid-3x1 { grid-template-columns: repeat(3, 1fr); grid-template-rows: 1fr; }
+        .grid-3x2 { grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, 1fr); }
+        .grid-3x3 { grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(3, 1fr); }
+        .grid-4x1 { grid-template-columns: repeat(4, 1fr); grid-template-rows: 1fr; }
+        .grid-4x2 { grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(2, 1fr); }
+        .grid-4x3 { grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(3, 1fr); }
+        .grid-4x4 { grid-template-columns: repeat(4, 1fr); grid-template-rows: repeat(4, 1fr); }
         .video-cell {
             background: #000;
             border: 1px solid #444;
@@ -264,6 +324,8 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            min-height: 0;
+            min-width: 0;
         }
         .cell-header {
             background: #222;
@@ -441,21 +503,14 @@
 <!-- Niezależny lewy panel boczny z urządzeniami -->
 <aside class="sidebar">
     <div class="panel">
-        <h3>Urządzenia</h3>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <h3 style="margin:0; border:none; padding:0;">Urządzenia</h3>
+            <button type="button" class="btn-sync-all" onclick="syncAllDvrNames(event)" title="Odśwież nazwy kanałów ze wszystkich rejestratorów" style="padding:2px 8px; font-size:11px; background:#383838; border:1px solid #555; color:#eee; border-radius:4px; cursor:pointer;">⟳ Odśwież nazwy</button>
+        </div>
         <div id="nvr-list" class="nvr-list">
             <div style="color: #888; font-size: 13px;">Ładowanie...</div>
         </div>
     </div>
-
-    <div class="panel">
-        <h3>Układ siatki Live</h3>
-        <div class="grid-buttons">
-            <button id="grid-btn-1" onclick="setGrid(1)">1x1</button>
-            <button id="grid-btn-4" class="active" onclick="setGrid(4)">2x2</button>
-            <button id="grid-btn-16" onclick="setGrid(16)">4x4</button>
-        </div>
-    </div>
-
 </aside>
 
 <section id="signed-in-user" class="signed-in-user" aria-label="Zalogowany użytkownik" hidden>
@@ -489,8 +544,25 @@
 
     <!-- Kontener zawartości zakładek -->
     <div class="views-container">
-        <!-- Zakładka 1: Widok z kamer (Live Grid) -->
-        <div id="view-live" class="video-grid grid-4"></div>
+        <!-- Zakładka 1: Widok z kamer (Live Grid + dolna belka wyboru układu) -->
+        <div id="view-live" style="display: flex; flex-direction: column; width: 100%; height: 100%; min-height: 0; overflow: hidden; gap: 8px;">
+            <div id="live-grid" class="video-grid" style="flex: 1; min-height: 0;"></div>
+            <div class="live-grid-toolbar">
+                <span class="live-grid-toolbar-label">Układ siatki kamer:</span>
+                <div class="live-grid-buttons">
+                    <button type="button" class="live-grid-btn" data-grid="1x1" onclick="setGrid(1, 1)" title="1 kamera (1×1)">1×1</button>
+                    <button type="button" class="live-grid-btn" data-grid="2x1" onclick="setGrid(2, 1)" title="2 kamery (2 kolumny, 1 wiersz)">2×1</button>
+                    <button type="button" class="live-grid-btn active" data-grid="2x2" onclick="setGrid(2, 2)" title="4 kamery (2×2)">2×2</button>
+                    <button type="button" class="live-grid-btn" data-grid="3x1" onclick="setGrid(3, 1)" title="3 kamery (3 kolumny, 1 wiersz)">3×1</button>
+                    <button type="button" class="live-grid-btn" data-grid="3x2" onclick="setGrid(3, 2)" title="6 kamer (3 kolumny, 2 wiersze)">3×2</button>
+                    <button type="button" class="live-grid-btn" data-grid="3x3" onclick="setGrid(3, 3)" title="9 kamer (3×3)">3×3</button>
+                    <button type="button" class="live-grid-btn" data-grid="4x1" onclick="setGrid(4, 1)" title="4 kamery (4 kolumny, 1 wiersz)">4×1</button>
+                    <button type="button" class="live-grid-btn" data-grid="4x2" onclick="setGrid(4, 2)" title="8 kamer (4 kolumny, 2 wiersze)">4×2</button>
+                    <button type="button" class="live-grid-btn" data-grid="4x3" onclick="setGrid(4, 3)" title="12 kamer (4 kolumny, 3 wiersze)">4×3</button>
+                    <button type="button" class="live-grid-btn" data-grid="4x4" onclick="setGrid(4, 4)" title="16 kamer (4×4)">4×4</button>
+                </div>
+            </div>
+        </div>
 
         <!-- Zakładka 2: Nagrania zgromadzone na kontrolerach -->
         <div id="view-recordings">
@@ -500,6 +572,7 @@
                 <select id="rec-camera-select" style="padding: 6px 12px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; min-width: 320px; font-size: 13px;" onchange="onRecCameraChange()">
                     <!-- Zasilane dynamicznie z zaznaczonych kontrolerów -->
                 </select>
+                <button type="button" onclick="syncAllDvrNames(event)" title="Odśwież nazwy kamer z rejestratorów" style="padding: 6px 10px; font-size: 12px; background: #333; color: #ccc; border: 1px solid #555; border-radius: 4px; cursor: pointer;">⟳ Odśwież nazwy</button>
                 <span id="rec-camera-info" style="font-size: 13px; color: #aaa;"></span>
             </div>
 
@@ -603,7 +676,13 @@
 
         <div id="view-downloads" style="display:none; overflow:auto; padding:16px;">
             <section class="panel">
-                <h2 style="margin-top:0;">Pobrania</h2>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                    <h2 style="margin:0;">Pobrania</h2>
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <span id="downloads-cache-indicator" style="font-size:12px; color:#aaa;">Pamięć podręczna: sprawdzanie…</span>
+                        <button type="button" onclick="cleanCacheAction(event)" style="padding:4px 10px; font-size:12px; background:#333; border:1px solid #555; color:#eee; border-radius:4px; cursor:pointer;">Wyczyść cache</button>
+                    </div>
+                </div>
                 <p class="settings-help">Maksymalnie dwa nagrania są przygotowywane jednocześnie. Historia jest przypisana do zalogowanego użytkownika lub tej przeglądarki.</p>
                 <div id="download-jobs-current" class="settings-help">Brak aktywnych pobrań.</div>
                 <h3 style="margin:20px 0 8px;">Historia</h3>
@@ -640,6 +719,7 @@
                         <input id="device-rtsp-path" type="text" value="/" placeholder="Ścieżka RTSP (dla kamery)">
                         <p class="settings-help" style="margin:0;">Przy edycji wpisz hasło ponownie — jest celowo ukryte i przed zapisem sprawdzimy rzeczywisty strumień RTSP.</p>
                         <button id="save-device-button" class="btn-success" onclick="addManualDevice()">Rozpoznaj i zapisz urządzenie</button>
+                        <button id="delete-device-button" class="btn-danger" type="button" style="display:none; background:#b02a37; border-color:#a52834; color:#fff; width:100%; margin-top:8px; padding:8px;" onclick="deleteEditingCamera()">Usuń tę kamerę</button>
                     </div>
                 </section>
             </div>
@@ -689,6 +769,15 @@
                             <p class="settings-help">Wyższa jakość zajmuje więcej miejsca. Zmiana jakości może wydłużyć przygotowanie pliku. Eksport obecnie zawiera obraz bez dźwięku.</p>
                             <label class="settings-checkbox" for="download-anonymize"><input id="download-anonymize" type="checkbox">Anonimowość — zasłoń wykryte twarze w pobieranym nagraniu</label>
                             <p class="settings-help">Twarze są wykrywane i zakrywane czarną maską na serwerze, przed wysłaniem pliku do przeglądarki. Opcja wymaga ponownego zakodowania nagrania i może wydłużyć eksport.</p>
+                        </fieldset>
+                        <fieldset class="settings-fieldset" style="margin-top:16px;">
+                            <legend>Pamięć podręczna nagrań (Cache)</legend>
+                            <p class="settings-help">Tymczasowe pliki wideo z konwersji i anonimizacji pobrań. Czyszczenie usuwa stare pliki robocze bez wpływu na aktywne pobierania.</p>
+                            <div style="display:flex; align-items:center; gap:12px; margin-top:8px;">
+                                <span id="cache-size-display" style="font-weight:bold; font-size:13px; color:#ddd;">Rozmiar pamięci: sprawdzanie…</span>
+                                <button id="cache-clean-btn" type="button" onclick="cleanCacheAction(event)" style="padding:6px 14px; background:#333; border:1px solid #555; color:#fff; border-radius:4px; cursor:pointer;">Wyczyść pamięć podręczną</button>
+                            </div>
+                            <div id="cache-clean-status" class="settings-help" role="status" style="margin-top:6px;"></div>
                         </fieldset>
                         <div id="download-settings-status" role="status" aria-live="polite"></div>
                         <div id="download-browser-warning" class="settings-warning" hidden></div>
@@ -749,8 +838,17 @@
         <label>Hasło<span class="password-field"><input id="config-pass" type="password" placeholder="Pozostaw puste, aby nie zmieniać"><button class="password-toggle" type="button" aria-label="Pokaż hasło" title="Pokaż hasło" onclick="togglePasswordVisibility('config-pass', this)">◉</button></span></label>
         <label id="config-rtsp-row">Ścieżka RTSP<input id="config-rtsp-path"></label>
         <details class="settings-group" open><summary>Czas urządzenia</summary><div class="settings-group-body"><div id="device-time-status" class="settings-help">Odczytuj czas bezpośrednio z urządzenia.</div><button type="button" onclick="readDeviceTime()">Sprawdź czas</button> <button type="button" onclick="syncDeviceTime()">Ustaw czas z aplikacji</button></div></details>
+        <div id="config-sync-section" style="margin-top:10px;">
+            <button id="config-sync-names-btn" type="button" onclick="syncCurrentDeviceNames(event)" style="padding:6px 12px; font-size:12px; background:#333; border:1px solid #555; color:#eee; border-radius:4px; cursor:pointer;">⟳ Odśwież nazwy kanałów z NVR</button>
+        </div>
         <div id="device-config-status" class="settings-help" role="status"></div>
-        <div class="config-modal-actions"><button type="button" onclick="closeDeviceConfig()">Anuluj</button><button class="btn-success" style="width:auto; margin:0;" type="submit">Sprawdź i zapisz</button></div>
+        <div class="config-modal-actions" style="display:flex; justify-content:space-between; align-items:center;">
+            <button type="button" class="btn-danger" style="background:#b02a37; border-color:#a52834; color:#fff; padding:6px 14px; border-radius:4px; cursor:pointer;" onclick="deleteCurrentDevice()">Usuń urządzenie</button>
+            <div style="display:flex; gap:8px;">
+                <button type="button" onclick="closeDeviceConfig()">Anuluj</button>
+                <button class="btn-success" style="width:auto; margin:0;" type="submit">Sprawdź i zapisz</button>
+            </div>
+        </div>
     </form>
 </div>
 
@@ -811,7 +909,8 @@
         calCurrentMonth = today.getMonth() + 1;
         calSelectedDay = today.getDate();
 
-        setGrid(4);
+        const savedGrid = localStorage.getItem('nvr.live-grid-layout') || '2x2';
+        setGrid(savedGrid);
         initTabDragging();
         await initializeDeviceSelection();
         await refreshDvrList(false);
@@ -826,10 +925,11 @@
         for (const name of ['live', 'recordings', 'downloads', 'devices', 'settings']) {
             document.getElementById(`tab-btn-${name}`).classList.toggle('active', name === tabName);
             document.getElementById(`view-${name}`).style.display = name === tabName
-                ? (name === 'live' ? 'grid' : name === 'recordings' ? 'flex' : 'block') : 'none';
+                ? (name === 'live' ? 'flex' : name === 'recordings' ? 'flex' : 'block') : 'none';
         }
         if (tabName === 'recordings') updateRecCameraSelect();
-        if (tabName === 'downloads') window.refreshDownloadJobs?.();
+        if (tabName === 'downloads') { window.refreshDownloadJobs?.(); checkCacheSize(); }
+        if (tabName === 'settings') checkCacheSize();
     }
 
     function initTabDragging() {
@@ -1068,6 +1168,8 @@
         document.getElementById('config-pass').value = '';
         document.getElementById('config-rtsp-path').value = data.rtsp_path || '';
         document.getElementById('config-rtsp-row').hidden = data.type !== 'camera';
+        const syncBtn = document.getElementById('config-sync-names-btn');
+        if (syncBtn) syncBtn.hidden = data.type !== 'nvr';
         document.getElementById('device-config-status').textContent = '';
         document.getElementById('device-config-modal').hidden = false;
     }
@@ -1109,6 +1211,115 @@
         closeDeviceConfig();
         await refreshDvrList(false);
         await refreshChannelStatus();
+    }
+    async function deleteCurrentDevice() {
+        if (!configuringDevice) return;
+        const label = configuringDevice.type === 'nvr' ? 'rejestrator' : 'kamerę';
+        if (!confirm(`Czy na pewno chcesz usunąć ${label} "${configuringDevice.name}"? Tej operacji nie można cofnąć.`)) return;
+        const status = document.getElementById('device-config-status');
+        status.textContent = 'Usuwanie urządzenia…';
+        try {
+            const url = `/api/devices/${configuringDevice.type}/${configuringDevice.id}`;
+            const response = await fetch(url, { method: 'DELETE' });
+            if (!response.ok) {
+                let msg = 'Nie udało się usunąć urządzenia.';
+                try { msg = (await response.json()).detail || msg; } catch (_) {}
+                status.textContent = msg;
+                return;
+            }
+            closeDeviceConfig();
+            await refreshDvrList(false);
+            await refreshChannelStatus();
+            updateChannelSelectors();
+            updateRecCameraSelect();
+        } catch (e) {
+            status.textContent = 'Błąd: ' + e.message;
+        }
+    }
+    async function syncCurrentDeviceNames(event) {
+        if (!configuringDevice || configuringDevice.type !== 'nvr') return;
+        const btn = event?.currentTarget;
+        const status = document.getElementById('device-config-status');
+        if (btn) btn.disabled = true;
+        status.textContent = 'Odświeżanie nazw kanałów bezpośrednio z urządzenia…';
+        try {
+            const res = await fetch(`/api/dvrs/${configuringDevice.id}/sync-names`, { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+                status.textContent = `Odświeżono nazwy ${data.channels.length} kanałów!`;
+                await refreshDvrList(false);
+                updateChannelSelectors();
+                updateRecCameraSelect();
+            } else {
+                status.textContent = data.detail || 'Błąd odświeżania nazw kanałów.';
+            }
+        } catch (e) {
+            status.textContent = 'Błąd połączenia: ' + e.message;
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+    async function syncAllDvrNames(event) {
+        const btn = event?.currentTarget;
+        const origText = btn ? btn.textContent : '';
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = '⟳ Odświeżanie…';
+        }
+        try {
+            const res = await fetch('/api/dvrs/sync-names', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+                await refreshDvrList(false);
+                updateChannelSelectors();
+                updateRecCameraSelect();
+            } else {
+                alert(data.detail || 'Nie udało się odświeżyć nazw kanałów z rejestratorów.');
+            }
+        } catch (e) {
+            alert('Błąd odświeżania nazw: ' + e.message);
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = origText || '⟳ Odśwież nazwy';
+            }
+        }
+    }
+    async function checkCacheSize() {
+        try {
+            const res = await fetch('/api/cache/info');
+            if (!res.ok) return;
+            const data = await res.json();
+            const sizeStr = data.cache_size_gb > 0.05 ? `${data.cache_size_gb} GB` : `${data.cache_size_mb} MB`;
+            const el1 = document.getElementById('cache-size-display');
+            if (el1) el1.textContent = `Rozmiar pamięci: ${sizeStr} (${data.items_count} plików/katalogów)`;
+            const el2 = document.getElementById('downloads-cache-indicator');
+            if (el2) el2.textContent = `Pamięć podręczna: ${sizeStr}`;
+        } catch (_) {}
+    }
+    async function cleanCacheAction(event) {
+        const btn = event?.currentTarget || document.getElementById('cache-clean-btn');
+        const status = document.getElementById('cache-clean-status');
+        if (btn) btn.disabled = true;
+        if (status) status.textContent = 'Czyszczenie pamięci podręcznej…';
+        try {
+            const res = await fetch('/api/cache/clean', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok) {
+                const freedStr = data.freed_gb > 0.05 ? `${data.freed_gb} GB` : `${data.freed_mb} MB`;
+                if (status) status.textContent = `Wyczyszczono pamięć: zwolniono ${freedStr}.`;
+                alert(`Pamięć podręczna wyczyszczona. Zwolniono: ${freedStr}.`);
+            } else {
+                if (status) status.textContent = data.detail || 'Błąd podczas czyszczenia pamięci.';
+                alert(data.detail || 'Błąd podczas czyszczenia pamięci.');
+            }
+        } catch (e) {
+            if (status) status.textContent = 'Błąd: ' + e.message;
+            alert('Błąd: ' + e.message);
+        } finally {
+            if (btn) btn.disabled = false;
+            await checkCacheSize();
+        }
     }
     function toggleDeviceSelection(type, id) {
         const set = type === 'nvr' ? enabledDvrIds : enabledCameraIds;
@@ -1350,6 +1561,8 @@
     async function loadCameraForEdit(value) {
         editingCameraId = value ? Number(value) : null;
         const button = document.getElementById('save-device-button');
+        const delBtn = document.getElementById('delete-device-button');
+        if (delBtn) delBtn.style.display = editingCameraId ? 'block' : 'none';
         if (!editingCameraId) { button.textContent = 'Rozpoznaj i zapisz urządzenie'; return; }
         const response = await fetch('/api/devices'); const data = await response.json();
         const camera = data.devices.find(device => device.type === 'camera' && device.id === editingCameraId);
@@ -1361,6 +1574,34 @@
         document.getElementById('device-pass').value = '';
         document.getElementById('device-rtsp-path').value = '/mode=real&idc=1&ids=2';
         button.textContent = 'Sprawdź i zapisz zmiany kamery';
+    }
+    async function deleteEditingCamera() {
+        if (!editingCameraId) return;
+        const name = document.getElementById('device-name').value || 'tę kamerę';
+        if (!confirm(`Czy na pewno chcesz usunąć kamerę "${name}"? Tej operacji nie można cofnąć.`)) return;
+        try {
+            const res = await fetch(`/api/cameras/${editingCameraId}`, { method: 'DELETE' });
+            if (!res.ok) {
+                let err = 'Nie udało się usunąć kamery.';
+                try { err = (await res.json()).detail || err; } catch (_) {}
+                return alert(err);
+            }
+            editingCameraId = null;
+            document.getElementById('device-name').value = '';
+            document.getElementById('device-ip').value = '';
+            document.getElementById('device-pass').value = '';
+            const delBtn = document.getElementById('delete-device-button');
+            if (delBtn) delBtn.style.display = 'none';
+            document.getElementById('save-device-button').textContent = 'Rozpoznaj i zapisz urządzenie';
+            await refreshDvrList(false);
+            await refreshChannelStatus();
+            updateChannelSelectors();
+            updateRecCameraSelect();
+            renderCameraEditor();
+            alert('Kamera została pomyślnie usunięta.');
+        } catch (e) {
+            alert('Błąd podczas usuwania kamery: ' + e.message);
+        }
     }
     async function createCategory() {
         const input = document.getElementById('new-category-name'); const name = input.value.trim();
@@ -1479,17 +1720,41 @@
         }
     }
 
-    function setGrid(count) {
-        [1, 4, 16].forEach(c => {
-            const btn = document.getElementById(`grid-btn-${c}`);
-            if (btn) btn.classList.toggle('active', c === count);
+    function setGrid(colsOrCount, rows) {
+        let cols, count;
+        if (typeof colsOrCount === 'string' && colsOrCount.includes('x')) {
+            const parts = colsOrCount.split('x').map(Number);
+            cols = parts[0] || 2;
+            rows = parts[1] || 2;
+        } else if (rows !== undefined) {
+            cols = Number(colsOrCount);
+            rows = Number(rows);
+        } else {
+            const c = Number(colsOrCount);
+            if (c === 1) { cols = 1; rows = 1; }
+            else if (c === 4) { cols = 2; rows = 2; }
+            else if (c === 6) { cols = 3; rows = 2; }
+            else if (c === 9) { cols = 3; rows = 3; }
+            else if (c === 12) { cols = 4; rows = 3; }
+            else if (c === 16) { cols = 4; rows = 4; }
+            else { cols = Math.ceil(Math.sqrt(c)); rows = Math.ceil(c / cols); }
+        }
+        count = cols * rows;
+        const layoutKey = `${cols}x${rows}`;
+
+        try {
+            localStorage.setItem('nvr.live-grid-layout', layoutKey);
+        } catch (_) {}
+
+        document.querySelectorAll('.live-grid-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.grid === layoutKey);
         });
 
-        const grid = document.getElementById('view-live');
-        grid.className = 'video-grid';
-        if (count === 1) grid.classList.add('grid-1');
-        if (count === 4) grid.classList.add('grid-4');
-        if (count === 16) grid.classList.add('grid-16');
+        const grid = document.getElementById('live-grid');
+        if (!grid) return;
+        grid.className = `video-grid grid-${layoutKey}`;
+        grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+        grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
 
         for (let i = count; i < currentGridCount; i++) {
             closeCellConnection(i);
@@ -2073,6 +2338,7 @@
             emailEl.textContent = email;
             emailEl.title = email;
             panel.hidden = false;
+            document.body.classList.add('has-signed-in-user');
         } catch (_) {
             // The panel is optional; access control remains server-side.
         }

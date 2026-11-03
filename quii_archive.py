@@ -22,6 +22,10 @@ class ArchiveError(Exception):
     pass
 
 
+class ArchiveCancelled(ArchiveError):
+    pass
+
+
 def anonymize_worker_count() -> int:
     """Choose a safe OpenCV worker count for this host/container.
 
@@ -381,7 +385,7 @@ def archive_frames(ip, port, user, password, recording, start, end):
             yield payload
 
 
-def save_video(ip, port, user, password, selections, target: Path):
+def save_video(ip, port, user, password, selections, target: Path, is_cancelled=None):
     """Remove the vendor envelope, preserving real H.264/HEVC video bytes."""
     codec = nominal_fps = None
     count = total = 0
@@ -394,6 +398,8 @@ def save_video(ip, port, user, password, selections, target: Path):
             intervals = deque(maxlen=256)
             segment_count = 0
             for payload in archive_frames(ip, port, user, password, recording, start, end):
+                if is_cancelled and is_cancelled():
+                    raise ArchiveCancelled("Pobieranie materiału zostało anulowane przez użytkownika.")
                 # E0/E1 are the inter/key video frames observed in uCMS.
                 # Other media types (including audio) are not repackaged yet.
                 if len(payload) < 24 or payload[:3] != b"\0\0\x01" or payload[3] not in (0xe0, 0xe1):
@@ -487,7 +493,7 @@ def convert_video(source: Path, target: Path, codec, fps, preview=False, quality
         raise ArchiveError("FFmpeg nie zdołał przetworzyć rzeczywistego nagrania.")
 
 
-def anonymize_faces(source: Path, target: Path, progress_callback=None):
+def anonymize_faces(source: Path, target: Path, progress_callback=None, is_cancelled=None):
     """Write a H.264 copy with detected faces covered by black masks."""
     try:
         import cv2
@@ -705,6 +711,10 @@ def anonymize_faces(source: Path, target: Path, progress_callback=None):
 
     try:
         while True:
+            if is_cancelled and is_cancelled():
+                process.kill()
+                capture.release()
+                raise ArchiveCancelled("Anonimizacja została anulowana przez użytkownika.")
             ok, frame = capture.read()
             if not ok:
                 break

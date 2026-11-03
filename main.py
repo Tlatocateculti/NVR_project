@@ -16,7 +16,7 @@ import tempfile
 import logging
 import mimetypes
 import html
-from quii_archive import ArchiveError, Recording, save_video, convert_video, anonymize_faces
+from quii_archive import ArchiveError, ArchiveCancelled, Recording, save_video, convert_video, anonymize_faces
 from local_runtime import LocalRelay
 from live_proxy import open_mp4_proxy
 from auth import callback_url, oauth, settings as auth_settings
@@ -1639,6 +1639,175 @@ def update_dvr(dvr_id: int, update: NVRUpdate):
     return {"status": "success", "channels_count": len(channels)}
 
 
+def sync_dvr_channel_names(dvr_id: int) -> dict:
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        row = conn.execute("SELECT name, ip, port, user, password FROM dvrs WHERE id = ?", (dvr_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora.")
+        name, ip, port, user, password = row
+        nvr = NVR(name=name, ip=ip, port=port, user=user, password=password)
+        channels = fetch_nvr_channels(nvr)
+        for ch in channels:
+            ch_num = ch["channel_number"]
+            ch_name = ch["name"]
+            existing = conn.execute("SELECT 1 FROM channels WHERE dvr_id = ? AND channel_number = ?",
+                                    (dvr_id, ch_num)).fetchone()
+            if existing:
+                conn.execute("UPDATE channels SET name = ? WHERE dvr_id = ? AND channel_number = ?",
+                             (ch_name, dvr_id, ch_num))
+            else:
+                conn.execute("INSERT INTO channels (dvr_id, channel_number, name) VALUES (?, ?, ?)",
+                             (dvr_id, ch_num, ch_name))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "dvr_id": dvr_id, "channels": channels}
+
+
+@app.post("/api/dvrs/{dvr_id}/sync-names")
+def endpoint_sync_dvr_names(dvr_id: int):
+    return sync_dvr_channel_names(dvr_id)
+
+
+@app.post("/api/dvrs/sync-names")
+def endpoint_sync_all_dvr_names():
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        dvr_ids = [r[0] for r in conn.execute("SELECT id FROM dvrs").fetchall()]
+    finally:
+        conn.close()
+    results = {}
+    for did in dvr_ids:
+        try:
+            results[str(did)] = sync_dvr_channel_names(did)
+        except Exception as e:
+            results[str(did)] = {"status": "error", "detail": str(e)}
+    return {"status": "success", "results": results}
+
+
+@app.delete("/api/dvrs/{dvr_id}")
+def delete_dvr(dvr_id: int):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        exists = conn.execute("SELECT 1 FROM dvrs WHERE id = ?", (dvr_id,)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora.")
+        conn.execute("DELETE FROM device_category_items WHERE device_type = 'nvr' AND device_id = ?", (dvr_id,))
+        conn.execute("DELETE FROM channels WHERE dvr_id = ?", (dvr_id,))
+        conn.execute("DELETE FROM dvrs WHERE id = ?", (dvr_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "deleted_id": dvr_id, "type": "nvr"}
+
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera(camera_id: int):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        exists = conn.execute("SELECT 1 FROM cameras WHERE id = ?", (camera_id,)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Nie znaleziono kamery.")
+        conn.execute("DELETE FROM device_category_items WHERE device_type = 'camera' AND device_id = ?", (camera_id,))
+        conn.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "deleted_id": camera_id, "type": "camera"}
+
+
+@app.delete("/api/dvrs/{dvr_id}/channels/{channel_number}")
+def delete_dvr_channel(dvr_id: int, channel_number: int):
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        cursor = conn.execute("DELETE FROM channels WHERE dvr_id = ? AND channel_number = ?", (dvr_id, channel_number))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Nie znaleziono kanału.")
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "success", "dvr_id": dvr_id, "channel_number": channel_number}
+
+
+@app.delete("/api/devices/{device_type}/{device_id}")
+def delete_device(device_type: Literal["nvr", "camera"], device_id: int):
+    if device_type == "nvr":
+        return delete_dvr(device_id)
+    elif device_type == "camera":
+        return delete_camera(device_id)
+    raise HTTPException(status_code=400, detail="Nieobsługiwany typ urządzenia.")
+
+
+@app.get("/api/cache/info")
+def get_cache_info():
+    total_bytes = 0
+    file_count = 0
+    for folder in [Path("data/archive-tmp"), Path("data/archive-jobs")]:
+        if folder.exists():
+            for root, _, files in os.walk(folder):
+                for f in files:
+                    try:
+                        total_bytes += os.path.getsize(os.path.join(root, f))
+                        file_count += 1
+                    except OSError:
+                        pass
+    return {
+        "total_bytes": total_bytes,
+        "total_mb": round(total_bytes / (1024 * 1024), 1),
+        "total_gb": round(total_bytes / (1024 * 1024 * 1024), 2),
+        "file_count": file_count
+    }
+
+
+@app.post("/api/cache/clean")
+def clean_cache():
+    freed_bytes = 0
+    deleted_files = 0
+    tmp_dir = Path("data/archive-tmp")
+    if tmp_dir.exists():
+        for item in tmp_dir.iterdir():
+            try:
+                if item.is_file():
+                    freed_bytes += item.stat().st_size
+                    item.unlink()
+                    deleted_files += 1
+                elif item.is_dir():
+                    size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                    freed_bytes += size
+                    shutil.rmtree(item, ignore_errors=True)
+            except Exception:
+                pass
+
+    conn = sqlite3.connect("data/dvrs.db")
+    try:
+        active_paths = [r[0] for r in conn.execute("SELECT result_path FROM download_jobs WHERE status = 'processing'").fetchall() if r[0]]
+    finally:
+        conn.close()
+
+    jobs_dir = Path("data/archive-jobs")
+    if jobs_dir.exists():
+        for item in jobs_dir.iterdir():
+            if item.is_dir():
+                is_active = any(str(item) in str(ap) for ap in active_paths)
+                if not is_active:
+                    try:
+                        size = sum(f.stat().st_size for f in item.rglob('*') if f.is_file())
+                        freed_bytes += size
+                        shutil.rmtree(item, ignore_errors=True)
+                        deleted_files += 1
+                    except Exception:
+                        pass
+
+    return {
+        "status": "success",
+        "freed_bytes": freed_bytes,
+        "freed_mb": round(freed_bytes / (1024 * 1024), 1),
+        "freed_gb": round(freed_bytes / (1024 * 1024 * 1024), 2),
+        "deleted_files": deleted_files
+    }
+
+
 @app.get("/api/devices")
 def get_devices():
     conn = sqlite3.connect("data/dvrs.db")
@@ -2241,6 +2410,8 @@ class DownloadJobs:
         self.threads = []
         self.dvr_locks = {}
         self.dvr_locks_guard = Lock()
+        self.active_cancels: dict[str, Event] = {}
+        self.active_cancels_guard = Lock()
 
     def start(self):
         if self.threads:
@@ -2265,6 +2436,21 @@ class DownloadJobs:
 
     def enqueue(self, job_id: str):
         self.queue.put(job_id)
+
+    def cancel(self, job_id: str) -> bool:
+        with self.active_cancels_guard:
+            event = self.active_cancels.get(job_id)
+            if event is not None:
+                event.set()
+                return True
+        with sqlite3.connect("data/dvrs.db") as conn:
+            row = conn.execute("SELECT status FROM download_jobs WHERE id = ?", (job_id,)).fetchone()
+            if row and row[0] == "queued":
+                conn.execute("UPDATE download_jobs SET status = 'cancelled', stage = 'Anulowane przez użytkownika', finished_at = ? WHERE id = ?",
+                             (time_module.time(), job_id))
+                conn.commit()
+                return True
+        return False
 
     def _dvr_lock(self, dvr_id: int):
         with self.dvr_locks_guard:
@@ -2299,6 +2485,11 @@ class DownloadJobs:
             self.queue.put(job_id)
             time_module.sleep(0.2)
             return
+
+        cancel_event = Event()
+        with self.active_cancels_guard:
+            self.active_cancels[job_id] = cancel_event
+
         started = time_module.time()
         update_download_job(job_id, status="processing", stage="Pobieranie materiału z rejestratora", progress=1,
                             started_at=started, error=None)
@@ -2309,17 +2500,26 @@ class DownloadJobs:
         folder = None
         acquired = False
         try:
+            if cancel_event.is_set():
+                update_download_job(job_id, status="cancelled", stage="Anulowane przez użytkownika", progress=0,
+                                    finished_at=time_module.time(), duration_seconds=time_module.time() - started)
+                return
             # The legacy direct endpoint shares this same limiter, so every
             # user together can never make more than two recorder transfers.
             ARCHIVE_JOBS.acquire()
             acquired = True
             folder, result, result_name = build_queued_recording(
                 dvr_id, channel, date, filename, start_time, end_time, output_format, quality,
-                fps_choice, bool(anonymized), report,
+                fps_choice, bool(anonymized), report, is_cancelled=cancel_event.is_set,
             )
             update_download_job(job_id, status="ready", stage="Gotowe do pobrania", progress=100,
                                 finished_at=time_module.time(), duration_seconds=time_module.time() - started,
                                 result_path=str(result), result_name=result_name)
+        except ArchiveCancelled:
+            if folder:
+                shutil.rmtree(folder, ignore_errors=True)
+            update_download_job(job_id, status="cancelled", stage="Anulowane przez użytkownika", progress=0,
+                                finished_at=time_module.time(), duration_seconds=time_module.time() - started)
         except (ArchiveError, HTTPException, OSError, ValueError) as exc:
             if folder:
                 shutil.rmtree(folder, ignore_errors=True)
@@ -2328,6 +2528,8 @@ class DownloadJobs:
                                 finished_at=time_module.time(), duration_seconds=time_module.time() - started,
                                 error=detail)
         finally:
+            with self.active_cancels_guard:
+                self.active_cancels.pop(job_id, None)
             if acquired:
                 ARCHIVE_JOBS.release()
             recorder_lock.release()
@@ -2442,7 +2644,7 @@ def prepare_recording(dvr_id, channel, date, filename, start_time, end_time, pre
 
 
 def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time,
-                           output_format, quality, fps_choice, anonymize, report):
+                           output_format, quality, fps_choice, anonymize, report, is_cancelled=None):
     """Prepare one persisted queue item; the worker owns the temporary folder."""
     if output_format not in ("avi", "mp4") or quality not in ("original", "1080p", "720p", "480p"):
         raise HTTPException(status_code=422, detail="Nieprawidłowy format lub jakość nagrania.")
@@ -2485,7 +2687,9 @@ def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time
     try:
         source = folder / "source.video"
         report("Pobieranie materiału z rejestratora", 5)
-        codec, fps, _ = save_video(ip, port, user, password, selections, source)
+        codec, fps, _ = save_video(ip, port, user, password, selections, source, is_cancelled=is_cancelled)
+        if is_cancelled and is_cancelled():
+            raise ArchiveCancelled("Pobieranie materiału zostało anulowane przez użytkownika.")
         target_fps = float(fps_choice) if fps_choice in ("15", "10") else None
         eff_fps = target_fps if (target_fps and target_fps < fps) else fps
         detector_input = folder / "detector-input.mp4"
@@ -2493,10 +2697,15 @@ def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time
             report("Przygotowanie materiału HQ do anonimizacji", 35)
             convert_video(source, detector_input, codec, fps, quality="original",
                           target_fps=target_fps if (target_fps and target_fps < fps) else None)
+            if is_cancelled and is_cancelled():
+                raise ArchiveCancelled("Pobieranie materiału zostało anulowane przez użytkownika.")
             masked = folder / "masked.mp4"
             report("Wykrywanie i zasłanianie głów", 40)
             anonymize_faces(detector_input, masked,
-                            lambda fraction: report("Wykrywanie i zasłanianie głów", 40 + (fraction or 0) * 45))
+                            lambda fraction: report("Wykrywanie i zasłanianie głów", 40 + (fraction or 0) * 45),
+                            is_cancelled=is_cancelled)
+            if is_cancelled and is_cancelled():
+                raise ArchiveCancelled("Pobieranie materiału zostało anulowane przez użytkownika.")
             report("Kodowanie pliku wynikowego", 86)
             input_file, input_codec = masked, "h264"
         else:
@@ -2601,6 +2810,21 @@ def download_job_file(job_id: str, request: Request):
         raise HTTPException(status_code=409, detail="Plik nie jest jeszcze gotowy.")
     return FileResponse(result_path, filename=result_name, media_type="application/octet-stream",
                         headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/download-jobs/{job_id}/cancel")
+def cancel_download_job(job_id: str, request: Request):
+    owner_id = download_owner(request)
+    with sqlite3.connect("data/dvrs.db") as conn:
+        row = conn.execute("SELECT owner_id, status FROM download_jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Nie znaleziono zadania pobrania.")
+    if row[0] != owner_id and not is_admin(request):
+        raise HTTPException(status_code=403, detail="Brak uprawnień do anulowania tego zadania.")
+    if row[1] in ("ready", "failed", "cancelled"):
+        return {"status": row[1], "message": "Zadanie już zakończone."}
+    download_jobs.cancel(job_id)
+    return {"status": "cancelling", "id": job_id}
 
 
 @app.get("/api/recordings/preview")

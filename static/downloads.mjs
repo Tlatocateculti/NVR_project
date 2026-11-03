@@ -293,6 +293,25 @@ async function saveQueuedJob(jobId, filename = `nagranie-${jobId}.mp4`) {
     }
 }
 
+export async function cancelDownloadJob(jobId) {
+    if (!confirm('Czy na pewno chcesz zatrzymać to pobieranie?')) return;
+    try {
+        const response = await fetch(`/api/download-jobs/${encodeURIComponent(jobId)}/cancel`, {
+            method: 'POST',
+            cache: 'no-store',
+            headers: downloadHeaders(),
+        });
+        if (!response.ok) {
+            let message = 'Nie udało się zatrzymać pobierania.';
+            try { message = (await response.json()).detail || message; } catch (_) {}
+            alert(message);
+        }
+        await refreshDownloadJobs();
+    } catch (error) {
+        alert('Błąd podczas zatrzymywania: ' + error.message);
+    }
+}
+
 function renderDownloadJobs(jobs) {
     const current = element('download-jobs-current');
     const history = element('download-jobs-history');
@@ -304,15 +323,26 @@ function renderDownloadJobs(jobs) {
         const suffix = job.status === 'queued'
             ? `kolejka: ${job.queue_position}, orientacyjnie: ${durationText(job.eta_seconds)}`
             : `${job.progress}% · trwa: ${durationText(job.elapsed_seconds)} · do końca: ok. ${durationText(job.eta_seconds)}`;
-        return `<div style="margin:8px 0;"><strong>${escapeHtml(job.camera_name)}</strong> — ${escapeHtml(job.stage)}<br><progress max="100" value="${job.progress}"></progress> ${suffix}</div>`;
+        return `<div style="margin:8px 0; display:flex; align-items:center; justify-content:space-between; gap:12px; background:#2a2a2a; padding:8px 12px; border-radius:4px; border:1px solid #444;">
+            <div style="flex:1;"><strong>${escapeHtml(job.camera_name)}</strong> — ${escapeHtml(job.stage)}<br><progress max="100" value="${job.progress}"></progress> <span style="font-size:12px; color:#bbb;">${suffix}</span></div>
+            <button type="button" class="btn-cancel-job" data-cancel-job="${job.id}" style="background:#8b2b2b; color:#fff; border:1px solid #a33; border-radius:4px; padding:6px 12px; font-size:12px; cursor:pointer;">Zatrzymaj</button>
+        </div>`;
     }).join('') : (transfer ? '' : 'Brak aktywnych pobrań.'));
     history.innerHTML = jobs.length ? jobs.map(job => {
-        const status = job.status === 'ready' ? 'Gotowe' : job.status === 'failed' ? `Błąd: ${job.error || 'nieznany'}`
+        const status = job.status === 'ready' ? '<span style="color:#81c784;">Gotowe</span>'
+            : job.status === 'failed' ? `<span style="color:#e57373;">Błąd: ${escapeHtml(job.error || 'nieznany')}</span>`
+            : job.status === 'cancelled' ? '<span style="color:#e0a96d;">Anulowano</span>'
             : job.status === 'queued' ? `W kolejce (${job.queue_position})` : `${job.stage} — ${job.progress}%`;
-        const action = job.status === 'ready' ? `<button type="button" data-download-job="${job.id}" data-download-name="${escapeHtml(job.result_name)}">Pobierz plik</button>` : '';
-        return `<tr><td>${new Date(job.created_at * 1000).toLocaleString()}</td><td>${escapeHtml(job.dvr_name)} / ${escapeHtml(job.camera_name)}</td><td>${escapeHtml(job.recording_date)} ${escapeHtml(job.start_time)}–${escapeHtml(job.end_time)}</td><td>${job.anonymized ? 'Tak' : 'Nie'}</td><td>${escapeHtml(status)}</td><td>${action}</td></tr>`;
+        let action = '';
+        if (job.status === 'ready') {
+            action = `<button type="button" data-download-job="${job.id}" data-download-name="${escapeHtml(job.result_name)}">Pobierz plik</button>`;
+        } else if (['queued', 'processing'].includes(job.status)) {
+            action = `<button type="button" data-cancel-job="${job.id}" style="background:#8b2b2b; color:#fff; border:1px solid #a33; border-radius:4px; padding:4px 8px; font-size:11px; cursor:pointer;">Zatrzymaj</button>`;
+        }
+        return `<tr><td>${new Date(job.created_at * 1000).toLocaleString()}</td><td>${escapeHtml(job.dvr_name)} / ${escapeHtml(job.camera_name)}</td><td>${escapeHtml(job.recording_date)} ${escapeHtml(job.start_time)}–${escapeHtml(job.end_time)}</td><td>${job.anonymized ? 'Tak' : 'Nie'}</td><td>${status}</td><td>${action}</td></tr>`;
     }).join('') : '<tr><td colspan="6" class="devices-result-empty">Nie ma jeszcze pobrań.</td></tr>';
     history.querySelectorAll('[data-download-job]').forEach(button => button.addEventListener('click', () => saveQueuedJob(button.dataset.downloadJob, button.dataset.downloadName)));
+    document.querySelectorAll('[data-cancel-job]').forEach(button => button.addEventListener('click', () => cancelDownloadJob(button.dataset.cancelJob)));
 }
 
 export async function refreshDownloadJobs() {
@@ -353,5 +383,6 @@ async function initialize() {
 if (typeof document !== 'undefined') {
     window.requestRecordingDownload = requestDownload;
     window.refreshDownloadJobs = refreshDownloadJobs;
+    window.cancelDownloadJob = cancelDownloadJob;
     initialize();
 }
