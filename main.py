@@ -10,6 +10,7 @@ from queue import Queue, Empty
 from uuid import uuid4
 import asyncio
 import random
+import time
 import time as time_module
 import shutil
 import tempfile
@@ -69,6 +70,7 @@ GO2RTC_RTSP = os.environ.get(
 ).rstrip("/")
 LIVE_STREAM_LOCK = Lock()
 LIVE_STREAM_SIGNATURES = {}
+STREAM_RTSP_SOURCES: dict[str, str] = {}
 STREAM_COLOR_NORMALIZATION: dict[str, bool] = {}
 DISCOVERY_JOB_LOCK = Lock()
 DISCOVERY_CANCEL = Event()
@@ -482,6 +484,56 @@ def fetch_nvr_channels(nvr: NVR) -> list[dict]:
             pass
 
 
+NVR_CHANNEL_CONFIGS_CACHE: dict[int, tuple[float, dict[int, dict]]] = {}
+NVR_CHANNEL_CONFIGS_TTL = 300  # seconds
+
+
+def get_nvr_channel_camera_config(dvr_id: int, channel: int) -> dict | None:
+    """Retrieve direct camera connection parameters for an NVR channel if available."""
+    now = time.time()
+    cached = NVR_CHANNEL_CONFIGS_CACHE.get(dvr_id)
+    if cached and (now - cached[0] < NVR_CHANNEL_CONFIGS_TTL):
+        return cached[1].get(channel)
+
+    try:
+        conn = sqlite3.connect("data/dvrs.db")
+        try:
+            row = conn.execute("SELECT ip, port, user, password FROM dvrs WHERE id = ?", (dvr_id,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        ip, port, user, password = row
+        root = tdk_send_command(ip, user, password, "get.channelmanagement.config", timeout=3)
+        configs: dict[int, dict] = {}
+        if root is not None and root.findtext(".//error") in (None, "0"):
+            for ch_elem in root.findall(".//channel"):
+                ch_id_str = ch_elem.findtext("id")
+                if not ch_id_str or not ch_id_str.isdigit():
+                    continue
+                ch_num = int(ch_id_str)
+                cfg = ch_elem.find("config")
+                if cfg is None:
+                    continue
+                cam_ip = (cfg.findtext("ipaddress") or "").strip()
+                if not cam_ip or cam_ip in ("0.0.0.0", "127.0.0.1", ip):
+                    continue
+                enabled_str = (cfg.findtext("enabled") or "").strip().lower()
+                configs[ch_num] = {
+                    "enabled": enabled_str in ("true", "1"),
+                    "ip": cam_ip,
+                    "port": int(cfg.findtext("port") or 554) if (cfg.findtext("port") or "").isdigit() else 554,
+                    "user": (cfg.findtext("username") or "").strip(),
+                    "password": cfg.findtext("password") or "",
+                    "remoteid": (cfg.findtext("remoteid") or "1").strip() or "1",
+                    "protocol": (cfg.findtext("protocol") or "").strip().lower(),
+                }
+        NVR_CHANNEL_CONFIGS_CACHE[dvr_id] = (now, configs)
+        return configs.get(channel)
+    except Exception:
+        return None
+
+
 def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
     try:
         local_relay.ensure()
@@ -502,9 +554,29 @@ def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
 
     stream_id = stream if stream in (1, 2) else 2
     rtsp_qv = f"rtsp://{u_enc}:{p_enc}@{ip}:554/mode=real&idc={channel}&ids={stream_id}#media=video"
-
     stream_name = f"nvr_{dvr_id}_ch_{channel}_s_{stream_id}"
-    params = [("name", stream_name), ("src", rtsp_qv)]
+
+    # Prefer direct camera connection if channel is mapped to a known camera on the LAN
+    direct_rtsp = None
+    cam_cfg = get_nvr_channel_camera_config(dvr_id, channel)
+    if cam_cfg and cam_cfg.get("enabled", True) and cam_cfg.get("ip"):
+        cam_ip = cam_cfg["ip"]
+        cam_user = urllib.parse.quote(cam_cfg.get("user") or "", safe="")
+        cam_pass = urllib.parse.quote(cam_cfg.get("password") or "", safe="")
+        cam_cred = f"{cam_user}:{cam_pass}@" if cam_user or cam_pass else ""
+        remote_id = cam_cfg.get("remoteid") or "1"
+        direct_rtsp = f"rtsp://{cam_cred}{cam_ip}:554/mode=real&idc={remote_id}&ids={stream_id}#media=video"
+
+    primary_url = direct_rtsp if direct_rtsp else rtsp_qv
+    STREAM_RTSP_SOURCES[stream_name] = primary_url.split("#")[0]
+
+    params = [("name", stream_name)]
+    if direct_rtsp:
+        params.append(("src", direct_rtsp))
+        if stream_id == 1:
+            params.append(("src", f"ffmpeg:{direct_rtsp}#video=h264#timeout=15"))
+
+    params.append(("src", rtsp_qv))
     # Dla strumienia głównego (HQ, ids=1), który często jest kodowany w H.265 (HEVC),
     # dodajemy drugie źródło ffmpeg->H.264, aby WebRTC działało w przeglądarkach bez wsparcia HEVC.
     if stream_id == 1:
@@ -809,6 +881,7 @@ def ensure_camera_stream(camera_id: int, stream: int = 2) -> str:
     profile_path = camera_rtsp_path_for_stream(camera.rtsp_path, stream_id)
     rtsp = camera_rtsp_url(camera.ip, camera.port, camera.user, camera.password, profile_path)
     name = f"camera_{camera_id}_s_{stream_id}"
+    STREAM_RTSP_SOURCES[name] = rtsp.split("#")[0]
     params = [("name", name), ("src", rtsp)]
     if stream_id == 1:
         params.append(("src", f"ffmpeg:{rtsp}#video=h264#timeout=15"))
@@ -1232,38 +1305,109 @@ def save_discovery_network_preferences(networks: list[str]) -> list[ipaddress.IP
     return list(dict.fromkeys(selected))
 
 
+def get_rtsp_url_for_stream(stream_name: str) -> str | None:
+    """Resolve the direct RTSP source URL for a given stream name."""
+    url = STREAM_RTSP_SOURCES.get(stream_name)
+    if url:
+        return url.split("#")[0]
+
+    try:
+        m_cam = re.match(r"^camera_(\d+)_s_(\d+)$", stream_name)
+        if m_cam:
+            cam_id, stream_id = int(m_cam.group(1)), int(m_cam.group(2))
+            conn = sqlite3.connect("data/dvrs.db")
+            try:
+                row = conn.execute("SELECT ip, port, user, password, rtsp_path FROM cameras WHERE id = ?", (cam_id,)).fetchone()
+            finally:
+                conn.close()
+            if row:
+                ip, port, user, password, path = row
+                prof_path = camera_rtsp_path_for_stream(path, stream_id)
+                clean_url = camera_rtsp_url(ip, port, user, password, prof_path).split("#")[0]
+                STREAM_RTSP_SOURCES[stream_name] = clean_url
+                return clean_url
+
+        m_nvr = re.match(r"^nvr_(\d+)_ch_(\d+)_s_(\d+)$", stream_name)
+        if m_nvr:
+            dvr_id, ch, stream_id = int(m_nvr.group(1)), int(m_nvr.group(2)), int(m_nvr.group(3))
+            cam_cfg = get_nvr_channel_camera_config(dvr_id, ch)
+            if cam_cfg and cam_cfg.get("enabled", True) and cam_cfg.get("ip"):
+                cam_ip = cam_cfg["ip"]
+                cam_user = urllib.parse.quote(cam_cfg.get("user") or "", safe="")
+                cam_pass = urllib.parse.quote(cam_cfg.get("password") or "", safe="")
+                cam_cred = f"{cam_user}:{cam_pass}@" if cam_user or cam_pass else ""
+                remote_id = cam_cfg.get("remoteid") or "1"
+                clean_url = f"rtsp://{cam_cred}{cam_ip}:554/mode=real&idc={remote_id}&ids={stream_id}"
+                STREAM_RTSP_SOURCES[stream_name] = clean_url
+                return clean_url
+
+            conn = sqlite3.connect("data/dvrs.db")
+            try:
+                row = conn.execute("SELECT ip, port, user, password FROM dvrs WHERE id = ?", (dvr_id,)).fetchone()
+            finally:
+                conn.close()
+            if row:
+                ip, port, user, password = row
+                u_enc = urllib.parse.quote(user or "", safe="")
+                p_enc = urllib.parse.quote(password or "", safe="")
+                credentials = f"{u_enc}:{p_enc}@" if user or password else ""
+                clean_url = f"rtsp://{credentials}{ip}:554/mode=real&idc={ch}&ids={stream_id}"
+                STREAM_RTSP_SOURCES[stream_name] = clean_url
+                return clean_url
+    except Exception:
+        pass
+    return None
+
+
 def stream_needs_color_normalization(stream_name: str) -> bool:
-    """Detect broken H.264 VUI colour metadata once per active stream."""
+    """Detect broken H.264/HEVC VUI colour metadata (e.g. GBR matrix on YUV streams) once per active stream."""
     cached = STREAM_COLOR_NORMALIZATION.get(stream_name)
     if cached is not None:
         return cached
 
     ffprobe = os.environ.get("FFPROBE_BIN") or shutil.which("ffprobe")
     if not ffprobe:
-        STREAM_COLOR_NORMALIZATION[stream_name] = False
         return False
 
-    source = f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264"
-    try:
-        probe = subprocess.run(
-            [
-                ffprobe, "-v", "error", "-rtsp_transport", "tcp", "-timeout", "8000000",
-                "-show_entries", "stream=color_space,color_transfer,color_primaries",
-                "-of", "default=noprint_wrappers=1", source,
-            ],
-            capture_output=True, text=True, timeout=12, check=False,
-        )
-        details = dict(
-            line.split("=", 1) for line in probe.stdout.splitlines() if "=" in line
-        )
-        normalize = (
-            details.get("color_space") == "gbr"
-            or details.get("color_transfer") == "reserved"
-            or details.get("color_primaries") == "reserved"
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        normalize = False
-    STREAM_COLOR_NORMALIZATION[stream_name] = normalize
+    candidate_sources = []
+    direct = get_rtsp_url_for_stream(stream_name)
+    if direct:
+        candidate_sources.append(direct)
+    candidate_sources.append(f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}")
+
+    normalize = False
+    probed_successfully = False
+
+    for source in candidate_sources:
+        try:
+            probe = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-rtsp_transport", "tcp", "-timeout", "5000000",
+                    "-read_intervals", "%+#1",
+                    "-show_entries", "stream=color_space,color_transfer,color_primaries:frame=color_space,color_transfer,color_primaries",
+                    "-of", "default=noprint_wrappers=1", source,
+                ],
+                capture_output=True, text=True, timeout=8, check=False,
+            )
+            lines = [line.strip() for line in probe.stdout.splitlines() if "=" in line]
+            if lines:
+                probed_successfully = True
+                color_spaces = {v.lower().strip() for k, v in (line.split("=", 1) for line in lines) if k == "color_space"}
+                color_transfers = {v.lower().strip() for k, v in (line.split("=", 1) for line in lines) if k == "color_transfer"}
+                color_primaries = {v.lower().strip() for k, v in (line.split("=", 1) for line in lines) if k == "color_primaries"}
+
+                normalize = bool(
+                    {"gbr", "reserved"}.intersection(color_spaces)
+                    or any("gbr" in cs for cs in color_spaces)
+                    or {"reserved", "reserved0"}.intersection(color_transfers)
+                    or {"reserved", "reserved0"}.intersection(color_primaries)
+                )
+                break
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+    if probed_successfully:
+        STREAM_COLOR_NORMALIZATION[stream_name] = normalize
     return normalize
 
 
@@ -2158,6 +2302,11 @@ def start_camera_webrtc_session(camera_id: int, offer: WebRTCOffer, request: Req
     """The offer shape stays compatible with the NVR endpoint; channel is ignored."""
     try:
         stream_name = ensure_camera_stream(camera_id, offer.stream)
+        if stream_needs_color_normalization(stream_name):
+            raise HTTPException(
+                status_code=409,
+                detail="Stream requires color space normalization; use MP4 fallback instead.",
+            )
         w_req = urllib.request.Request(
             f"{GO2RTC_API}/api/webrtc?src={urllib.parse.quote(stream_name)}", data=offer.sdp.encode("utf-8"),
             headers={"Content-Type": "application/sdp"}, method="POST")
@@ -2179,9 +2328,10 @@ def proxy_mp4_stream(dvr_id: int, channel: int, stream: int = 2):
     binary = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
     if not binary:
         raise HTTPException(status_code=503, detail="Brak FFmpeg do podglądu obrazu.")
-    source = f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264"
+    needs_norm = stream_needs_color_normalization(stream_name)
+    source = (get_rtsp_url_for_stream(stream_name) if needs_norm else None) or f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264"
     try:
-        proxy = open_mp4_proxy(binary, source, stream_needs_color_normalization(stream_name))
+        proxy = open_mp4_proxy(binary, source, needs_norm)
     except OSError as exc:
         raise HTTPException(status_code=502, detail="Nie udało się odebrać obrazu z przekaźnika.") from exc
     return StreamingResponse(proxy.chunks(), media_type="video/mp4",
@@ -2194,7 +2344,12 @@ def proxy_camera_mp4_stream(camera_id: int, stream: int = 2):
     binary = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
     if not binary:
         raise HTTPException(status_code=503, detail="Brak FFmpeg do podglądu obrazu.")
-    proxy = open_mp4_proxy(binary, f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264", stream_needs_color_normalization(stream_name))
+    needs_norm = stream_needs_color_normalization(stream_name)
+    source = (get_rtsp_url_for_stream(stream_name) if needs_norm else None) or f"{GO2RTC_RTSP}/{urllib.parse.quote(stream_name)}?video=h264"
+    try:
+        proxy = open_mp4_proxy(binary, source, needs_norm)
+    except OSError as exc:
+        raise HTTPException(status_code=502, detail="Nie udało się odebrać obrazu z przekaźnika.") from exc
     return StreamingResponse(proxy.chunks(), media_type="video/mp4", background=BackgroundTask(proxy.close))
 
 

@@ -2,6 +2,7 @@ import asyncio
 from io import BytesIO
 import json
 import unittest
+import urllib.parse
 from unittest.mock import patch, MagicMock
 
 import main
@@ -72,6 +73,114 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(main.vendor_from_http_fingerprint("Kenik -HTTPServer"), "Kenik")
         self.assertEqual(main.vendor_from_http_fingerprint("Server: Qualvision -HTTPServer"), "Qualvision")
         self.assertEqual(main.vendor_from_http_fingerprint("Hikvision Web Components"), "Hikvision")
+
+    def test_camera_webrtc_rejects_stream_needing_color_normalization(self):
+        offer = main.WebRTCOffer(dvr_id=2, channel=1, sdp="offer", stream=2)
+        request = MagicMock()
+        request.url.hostname = "127.0.0.1"
+        with patch("main.ensure_camera_stream", return_value="camera_2_s_2"), \
+                patch("main.stream_needs_color_normalization", return_value=True):
+            with self.assertRaises(main.HTTPException) as ctx:
+                main.start_camera_webrtc_session(2, offer, request)
+            self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_nvr_webrtc_rejects_stream_needing_color_normalization(self):
+        offer = main.WebRTCOffer(dvr_id=4, channel=16, sdp="offer", stream=1)
+        request = MagicMock()
+        request.url.hostname = "127.0.0.1"
+        with patch("main.ensure_go2rtc_stream", return_value="nvr_4_ch_16_s_1"), \
+                patch("main.stream_needs_color_normalization", return_value=True):
+            with self.assertRaises(main.HTTPException) as ctx:
+                main.start_webrtc_session(offer, request)
+            self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_camera_mp4_passes_color_normalization_flag(self):
+        with patch("main.ensure_camera_stream", return_value="camera_2_s_1"), \
+                patch("main.open_mp4_proxy", return_value=MagicMock()) as open_proxy, \
+                patch("main.stream_needs_color_normalization", return_value=True), \
+                patch("main.get_rtsp_url_for_stream", return_value="rtsp://camera:554/live"), \
+                patch.dict("os.environ", {"FFMPEG_BIN": "ffmpeg"}):
+            main.proxy_camera_mp4_stream(2, 1)
+            open_proxy.assert_called_once_with("ffmpeg", "rtsp://camera:554/live", True)
+
+    def test_nvr_mp4_passes_color_normalization_flag(self):
+        with patch("main.ensure_go2rtc_stream", return_value="nvr_4_ch_16_s_1"), \
+                patch("main.open_mp4_proxy", return_value=MagicMock()) as open_proxy, \
+                patch("main.stream_needs_color_normalization", return_value=True), \
+                patch("main.get_rtsp_url_for_stream", return_value="rtsp://admin:pwd@192.168.49.82:554/live"), \
+                patch.dict("os.environ", {"FFMPEG_BIN": "ffmpeg"}):
+            main.proxy_mp4_stream(4, 16, 1)
+            open_proxy.assert_called_once_with("ffmpeg", "rtsp://admin:pwd@192.168.49.82:554/live", True)
+
+    def test_stream_needs_color_normalization_detects_gbr_metadata(self):
+        main.STREAM_COLOR_NORMALIZATION.clear()
+        mock_output = "color_space=gbr\ncolor_transfer=reserved\ncolor_primaries=reserved\n"
+        with patch("main.get_rtsp_url_for_stream", return_value="rtsp://test"), \
+                patch("shutil.which", return_value="ffprobe"), \
+                patch("subprocess.run", return_value=MagicMock(returncode=0, stdout=mock_output)):
+            self.assertTrue(main.stream_needs_color_normalization("camera_test"))
+
+    def test_stream_needs_color_normalization_passes_normal_bt709(self):
+        main.STREAM_COLOR_NORMALIZATION.clear()
+        mock_output = "color_space=bt709\ncolor_transfer=bt709\ncolor_primaries=bt709\n"
+        with patch("main.get_rtsp_url_for_stream", return_value="rtsp://test"), \
+                patch("shutil.which", return_value="ffprobe"), \
+                patch("subprocess.run", return_value=MagicMock(returncode=0, stdout=mock_output)):
+            self.assertFalse(main.stream_needs_color_normalization("camera_normal"))
+
+    def test_nvr_stream_prefers_direct_camera_source_when_available(self):
+        main.STREAM_RTSP_SOURCES.clear()
+        main.LIVE_STREAM_SIGNATURES.clear()
+        puts = []
+
+        def fake_urlopen(request, **kwargs):
+            if isinstance(request, str):
+                return BytesIO(b"{}")
+            puts.append(request.full_url)
+            return BytesIO(b"")
+
+        cam_config = {
+            "enabled": True,
+            "ip": "192.168.49.80",
+            "port": 80,
+            "user": "admin",
+            "password": "pwd",
+            "remoteid": "1",
+            "protocol": "onvif",
+        }
+        with patch("main.sqlite3.connect") as connect, \
+                patch("main.get_nvr_channel_camera_config", return_value=cam_config), \
+                patch("main.urllib.request.urlopen", side_effect=fake_urlopen):
+            connect.return_value.cursor.return_value.fetchone.return_value = (
+                "192.168.49.252", 34567, "admin", "nvrpass")
+            stream_name = main.ensure_go2rtc_stream(4, 14, 1)
+
+            self.assertEqual(stream_name, "nvr_4_ch_14_s_1")
+            self.assertEqual(
+                main.STREAM_RTSP_SOURCES.get("nvr_4_ch_14_s_1"),
+                "rtsp://admin:pwd@192.168.49.80:554/mode=real&idc=1&ids=1",
+            )
+            self.assertEqual(len(puts), 1)
+            # Direct camera stream must be registered as primary source before NVR relay
+            put_url = urllib.parse.unquote(puts[0])
+            self.assertIn("src=rtsp://admin:pwd@192.168.49.80:554/mode=real&idc=1&ids=1#media=video", put_url)
+            self.assertIn("src=rtsp://admin:nvrpass@192.168.49.252:554/mode=real&idc=14&ids=1#media=video", put_url)
+            self.assertTrue(put_url.index("192.168.49.80") < put_url.index("192.168.49.252"))
+
+    def test_get_rtsp_url_for_stream_uses_channel_camera_config(self):
+        main.STREAM_RTSP_SOURCES.clear()
+        cam_config = {
+            "enabled": True,
+            "ip": "192.168.49.80",
+            "port": 80,
+            "user": "admin",
+            "password": "pwd",
+            "remoteid": "1",
+            "protocol": "onvif",
+        }
+        with patch("main.get_nvr_channel_camera_config", return_value=cam_config):
+            url = main.get_rtsp_url_for_stream("nvr_4_ch_14_s_1")
+            self.assertEqual(url, "rtsp://admin:pwd@192.168.49.80:554/mode=real&idc=1&ids=1")
 
 
 if __name__ == "__main__":
