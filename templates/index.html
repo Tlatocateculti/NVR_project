@@ -874,6 +874,7 @@
     let fullScanTimer = null;
     let scanResultsData = [];
     let scanSort = { column: 'ip', direction: 'asc' };
+    let activeScanRequest = 0;
     let editingCameraId = null;
     let configuringDevice = null;
     let currentGridCount = 4;
@@ -902,7 +903,7 @@
         "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"
     ];
 
-    window.onload = async () => {
+    window.onload = () => {
         // Domyślna data z zegara
         const today = new Date();
         calCurrentYear = today.getFullYear();
@@ -912,12 +913,24 @@
         const savedGrid = localStorage.getItem('nvr.live-grid-layout') || '2x2';
         setGrid(savedGrid);
         initTabDragging();
-        await initializeDeviceSelection();
-        await refreshDvrList(false);
-        await loadTimeSyncSettings();
-        await refreshChannelStatus();
-        window.setInterval(refreshChannelStatus, 60000);
+        // Rendering the shell must never wait for the network. These calls
+        // only enrich already visible UI and can complete independently.
+        void initializeApplicationData();
     };
+
+    async function initializeApplicationData() {
+        try {
+            await initializeDeviceSelection();
+            await refreshDvrList(false);
+        } catch (error) {
+            console.error('Nie udało się odświeżyć listy urządzeń:', error);
+        }
+        // Device status and settings are non-essential after a reload; never
+        // make their latency part of the initial-page critical path.
+        void loadTimeSyncSettings();
+        window.setTimeout(() => { void refreshChannelStatus(); }, 0);
+        window.setInterval(refreshChannelStatus, 60000);
+    }
 
     // Przełączanie głównych zakładek bez resetowania strumieni WebRTC
     function switchMainTab(tabName) {
@@ -989,10 +1002,13 @@
     }
 
     async function refreshDvrList() {
-        const response = await fetch('/api/dvrs');
-        dvrDatabase = await response.json();
-        const devicesResponse = await fetch('/api/devices');
-        const deviceData = await devicesResponse.json();
+        const [response, devicesResponse] = await Promise.all([
+            fetch('/api/dvrs', {cache: 'no-store'}),
+            fetch('/api/devices', {cache: 'no-store'}),
+        ]);
+        if (!response.ok || !devicesResponse.ok) throw new Error('Nie udało się pobrać listy urządzeń.');
+        const [dvrs, deviceData] = await Promise.all([response.json(), devicesResponse.json()]);
+        dvrDatabase = dvrs;
         deviceDatabase = deviceData.devices;
         deviceCategories = deviceData.categories;
 
@@ -1139,7 +1155,8 @@
                 const item = document.createElement('div');
                 item.className = `nvr-item ${isChecked ? 'active' : ''}`;
                 item.onclick = (e) => { if (!e.target.closest('input, button')) toggleDeviceSelection(device.type, device.id); };
-                item.innerHTML = `<input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleDeviceSelection('${device.type}', ${device.id})"><div class="nvr-info"><span class="nvr-title">${device.name}</span><span class="nvr-meta">${device.ip}:${device.port} · ${chCount} ${device.type === 'nvr' ? 'kan.' : 'kamera'}</span><span class="device-type">${device.type === 'nvr' ? 'Rejestrator' : 'Kamera'}</span></div><button class="device-menu" title="Konfiguracja ${device.name}" aria-label="Konfiguracja ${device.name}" onclick="openDeviceConfig('${device.type}', ${device.id})">⋯</button>`;
+                const deviceLabel = `${device.type === 'nvr' ? 'Rejestrator' : 'Kamera'}${device.vendor ? ` (${device.vendor})` : ''}`;
+                item.innerHTML = `<input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleDeviceSelection('${device.type}', ${device.id})"><div class="nvr-info"><span class="nvr-title">${device.name}</span><span class="nvr-meta">${device.ip}:${device.port} · ${chCount} ${device.type === 'nvr' ? 'kan.' : 'kamera'}</span><span class="device-type">${deviceLabel}</span></div><button class="device-menu" title="Konfiguracja ${device.name}" aria-label="Konfiguracja ${device.name}" onclick="openDeviceConfig('${device.type}', ${device.id})">⋯</button>`;
                 groupList.appendChild(item);
             });
             listEl.appendChild(group);
@@ -1379,13 +1396,16 @@
     }
 
     async function scanDevices() {
+        const requestId = ++activeScanRequest;
         const status = document.getElementById('scan-status');
         const targets = document.getElementById('scan-targets').value.trim();
         const user = document.getElementById('scan-user').value.trim();
         const password = document.getElementById('scan-pass').value;
         status.textContent = 'Wyszukiwanie urządzeń…';
-        const response = await fetch('/api/devices/scan', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({targets, user, password}) });
+        const response = await fetch('/api/devices/scan', { method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({targets, user, password}) });
         const body = await response.json();
+        // A slow earlier scan must not overwrite a newer response.
+        if (requestId !== activeScanRequest) return;
         if (!response.ok) { status.textContent = body.detail || 'Nie udało się wykryć urządzeń.'; return; }
         status.textContent = `${body.method}: znaleziono ${body.devices.length} urządzeń.`;
         renderScanResults(body.devices);
@@ -1433,11 +1453,19 @@
         const selector = document.getElementById('full-scan-selector');
         modal.hidden = false; progress.textContent = 'Pobieranie możliwych sieci…'; networks.textContent = ''; selector.hidden = false; selector.innerHTML = ''; document.getElementById('full-scan-add-row').hidden = false;
         document.getElementById('full-scan-start').hidden = false;
-        const response = await fetch('/api/devices/full-scan/candidates');
-        const body = await response.json().catch(() => ({}));
-        if (!response.ok || !body.networks?.length) { progress.textContent = body.detail || 'Brak podstawy do wyznaczenia lokalnych sieci.'; return; }
-        progress.textContent = `Wybierz podsieci do skanowania (${body.networks.length} możliwych).`;
-        renderFullScanCandidates(body.networks);
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 8000);
+        try {
+            const response = await fetch('/api/devices/full-scan/candidates', {signal: controller.signal, cache: 'no-store'});
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok || !body.networks?.length) { progress.textContent = body.detail || 'Brak podstawy do wyznaczenia lokalnych sieci.'; return; }
+            progress.textContent = `Wybierz podsieci do skanowania (${body.networks.length} możliwych).`;
+            renderFullScanCandidates(body.networks);
+        } catch (_) {
+            progress.textContent = 'Nie udało się szybko pobrać listy sieci. Zamknij okno i spróbuj ponownie.';
+        } finally {
+            window.clearTimeout(timeout);
+        }
     }
 
     function renderFullScanCandidates(networks) {
@@ -1510,6 +1538,9 @@
         document.getElementById('device-ip').value = device.ip;
         document.getElementById('device-port').value = device.port;
         document.getElementById('device-rtsp-path').value = device.rtsp_path || '/';
+        // Re-detect on save. A stale list entry must not force a recorder
+        // into the camera-save path.
+        document.getElementById('device-type-choice').value = 'auto';
     }
     async function addManualDevice() {
         const name = document.getElementById('device-name').value.trim();
@@ -1522,7 +1553,7 @@
         const requestedType = document.getElementById('device-type-choice').value;
         let detectedType = requestedType === 'auto' ? 'camera' : requestedType;
         if (requestedType === 'auto') try {
-            const scan = await fetch('/api/devices/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({targets:ip})});
+            const scan = await fetch('/api/devices/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({targets:ip, user, password})});
             const data = await scan.json();
             if (scan.ok && data.devices[0]) detectedType = data.devices[0].type;
         } catch (_) {}
@@ -1999,6 +2030,13 @@
        LOGIKA MODUŁU NAGRANIA (ZAKŁADKA 2)
        =============================================================== */
 
+    function recordingsTabIsVisible() {
+        // ``#view-recordings`` has display:flex in the stylesheet, so its
+        // inline style is initially empty even though the Live tab is active.
+        // The active tab button is the single source of truth.
+        return document.getElementById('tab-btn-recordings')?.classList.contains('active') === true;
+    }
+
     function updateRecCameraSelect() {
         const sel = document.getElementById('rec-camera-select');
         if (!sel) return;
@@ -2027,7 +2065,9 @@
             sel.selectedIndex = 1;
         }
 
-        onRecCameraChange();
+        // Refreshing devices or their status happens on every screen. Do not
+        // contact a recorder for recording indexes until its tab is opened.
+        if (recordingsTabIsVisible()) onRecCameraChange();
     }
 
     async function onRecCameraChange() {

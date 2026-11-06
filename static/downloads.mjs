@@ -354,6 +354,16 @@ export async function refreshDownloadJobs() {
     } catch (_) {}
 }
 
+function downloadsTabIsVisible() {
+    const view = element('view-downloads');
+    return Boolean(view && view.style.display !== 'none');
+}
+
+async function refreshVisibleDownloadJobs() {
+    if (!downloadsTabIsVisible()) return;
+    await refreshDownloadJobs();
+}
+
 async function initialize() {
     try { settings = normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}')); } catch (_) {}
     try { directory = await directoryStorage(); } catch (_) {
@@ -376,8 +386,9 @@ async function initialize() {
     });
     element('download-cancel').addEventListener('click', () => activeDownload?.abort());
     element('download-dismiss').addEventListener('click', () => { element('download-notice').hidden = true; });
-    window.setInterval(refreshDownloadJobs, 3000);
-    refreshDownloadJobs();
+    // The history is only relevant in its own tab. Polling it globally every
+    // three seconds created needless requests while working with devices.
+    window.setInterval(refreshVisibleDownloadJobs, 10000);
 }
 
 if (typeof document !== 'undefined') {

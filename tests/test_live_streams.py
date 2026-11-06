@@ -57,6 +57,75 @@ class LiveTests(unittest.TestCase):
         path = "/Streaming/Channels/101"
         self.assertEqual(main.camera_rtsp_path_for_stream(path, 1), path)
 
+    def test_hikvision_camera_uses_documented_profile_paths(self):
+        self.assertEqual(main.camera_rtsp_path_for_stream("/Streaming/Channels/102", 1),
+                         "/Streaming/Channels/101")
+        self.assertEqual(main.hikvision_rtsp_path(14, 1), "/Streaming/Channels/1401")
+        self.assertEqual(main.hikvision_rtsp_path(14, 2), "/Streaming/Channels/1402")
+
+    def test_hikvision_channel_inventory_uses_isapi_xml(self):
+        response = b'''<InputProxyChannelList xmlns="http://www.hikvision.com/ver20/XMLSchema"><InputProxyChannel><id>1</id><name>Brama</name></InputProxyChannel><InputProxyChannel><id>14</id></InputProxyChannel></InputProxyChannelList>'''
+        nvr = main.NVR(name="Hikvision", ip="192.168.90.20", port=8000,
+                       user="admin", password="secret")
+        with patch("main.hikvision_isapi_get", return_value=response):
+            self.assertEqual(main.fetch_hikvision_channels(nvr), [
+                {"channel_number": 1, "name": "Brama"},
+                {"channel_number": 14, "name": "Kanał 14"},
+            ])
+
+    def test_hikvision_archive_search_parses_isapi_segments(self):
+        response = b'''<CMSearchResult xmlns="http://www.isapi.org/ver20/XMLSchema"><responseStatusStrg>OK</responseStatusStrg><matchList><searchMatchItem><timeSpan><startTime>2026-11-06T10:00:00Z</startTime><endTime>2026-11-06T10:05:00Z</endTime></timeSpan><mediaSegmentDescriptor><playbackURI>rtsp://192.0.2.37/Streaming/tracks/101?starttime=20261106T100000Z&amp;endtime=20261106T100500Z</playbackURI></mediaSegmentDescriptor></searchMatchItem></matchList></CMSearchResult>'''
+        with patch("main.hikvision_isapi_post", return_value=response):
+            segments = main.hikvision_search_recordings(
+                "192.0.2.37", "admin", "secret", 1,
+                main.datetime(2026, 11, 6), main.datetime(2026, 11, 7),
+            )
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["start"], main.datetime(2026, 11, 6, 10))
+        self.assertEqual(segments[0]["end"], main.datetime(2026, 11, 6, 10, 5))
+        self.assertTrue(segments[0]["filename"].startswith("hikvision:"))
+
+    def test_hikvision_device_info_distinguishes_camera_from_recorder(self):
+        camera_xml = b"<DeviceInfo><deviceType>IPCamera</deviceType></DeviceInfo>"
+        nvr_xml = b"<DeviceInfo><deviceType>Network Video Recorder</deviceType></DeviceInfo>"
+        with patch("main.hikvision_isapi_get", return_value=camera_xml):
+            self.assertEqual(main.hikvision_device_kind("192.0.2.15", "admin", "secret"), "camera")
+        with patch("main.hikvision_isapi_get", return_value=nvr_xml):
+            self.assertEqual(main.hikvision_device_kind("192.0.2.10", "admin", "secret"), "nvr")
+
+    def test_hikvision_port_8000_without_authenticated_probe_is_not_assumed_to_be_nvr(self):
+        self.assertEqual(main.classify_host("192.0.2.15", {80, 554, 8000}), "camera")
+
+    def test_hikvision_legacy_web_ui_identifies_nvr_without_credentials(self):
+        self.assertEqual(main.hikvision_web_kind("192.0.2.37", "<script src='/doc/page/playback.asp'></script>"), "nvr")
+        self.assertEqual(main.hikvision_web_kind("192.0.2.15", "<a href='/doc/index.html#/preview'>IP Camera</a>"), "camera")
+
+    def test_scan_uses_hikvision_web_ui_before_credentials_are_entered(self):
+        def connect(address, timeout):
+            if address[1] in {80, 554, 8000}:
+                return MagicMock()
+            raise OSError
+
+        with patch("main.socket.create_connection", side_effect=connect), \
+                patch("main.http_device_fingerprint", return_value="<script src='/doc/page/playback.asp'></script>"):
+            result = main.scan_host("192.0.2.37")
+        self.assertEqual(result["type"], "nvr")
+        self.assertEqual(result["vendor"], "Hikvision")
+        self.assertEqual(result["port"], 8000)
+
+    def test_hikvision_nvr_stream_uses_its_rtsp_path(self):
+        main.STREAM_RTSP_SOURCES.clear()
+        main.LIVE_STREAM_SIGNATURES.clear()
+        with patch("main.sqlite3.connect") as connect, \
+                patch("main.is_hikvision_nvr", return_value=True), \
+                patch("main.urllib.request.urlopen", return_value=BytesIO(b"{}")) as urlopen:
+            connect.return_value.cursor.return_value.fetchone.return_value = (
+                "192.168.90.20", 8000, "admin", "secret")
+            main.ensure_go2rtc_stream(7, 14, 2)
+            self.assertEqual(main.STREAM_RTSP_SOURCES["nvr_7_ch_14_s_2"],
+                             "rtsp://admin:secret@192.168.90.20:554/Streaming/Channels/1402")
+            self.assertIn("/Streaming/Channels/1402", urllib.parse.unquote(urlopen.call_args.args[0].full_url))
+
     def test_registered_nvr_credentials_do_not_replace_explicit_camera_password(self):
         camera = main.Camera(name="", ip="192.0.2.56", user="admin", password="camera-password")
         with patch("main.camera_connection_from_registered_nvr", return_value=("nvr-user", "nvr-password", "quvii")), \

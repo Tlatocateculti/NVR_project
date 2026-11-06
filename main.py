@@ -72,6 +72,11 @@ LIVE_STREAM_LOCK = Lock()
 LIVE_STREAM_SIGNATURES = {}
 STREAM_RTSP_SOURCES: dict[str, str] = {}
 STREAM_COLOR_NORMALIZATION: dict[str, bool] = {}
+HIKVISION_NVR_CACHE: dict[tuple[str, str], tuple[float, bool]] = {}
+# Some NVR firmwares silently cap ContentMgmt/search at 64 matches even when
+# maxResults is higher.  Keep this explicit so calendar search can split a
+# saturated time range instead of silently omitting later days.
+HIKVISION_SEARCH_RESULT_LIMIT = 64
 DISCOVERY_JOB_LOCK = Lock()
 DISCOVERY_CANCEL = Event()
 DISCOVERY_JOB: dict = {"running": False, "cancelled": False, "network": "", "completed": 0,
@@ -109,6 +114,7 @@ class NVR(BaseModel):
     port: int
     user: str
     password: str
+    vendor: str | None = None
 
 
 class NVRUpdate(BaseModel):
@@ -117,6 +123,7 @@ class NVRUpdate(BaseModel):
     port: int
     user: str
     password: str = ""
+    vendor: str | None = None
 
 
 class WebRTCOffer(BaseModel):
@@ -133,6 +140,7 @@ class Camera(BaseModel):
     user: str = "admin"
     password: str = ""
     rtsp_path: str = "/"
+    vendor: str | None = None
     category_ids: list[int] = []
 
 
@@ -360,7 +368,8 @@ def init_db():
     conn = sqlite3.connect('data/dvrs.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS dvrs
-                 (id INTEGER PRIMARY KEY, name TEXT, ip TEXT, port INTEGER, user TEXT, password TEXT)''')
+                 (id INTEGER PRIMARY KEY, name TEXT, ip TEXT, port INTEGER, user TEXT, password TEXT,
+                  vendor TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS channels
                  (id INTEGER PRIMARY KEY,
                   dvr_id INTEGER,
@@ -413,6 +422,10 @@ def init_db():
         c.execute("ALTER TABLE discovery_scan_networks ADD COLUMN custom INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE dvrs ADD COLUMN vendor TEXT")
+    except sqlite3.OperationalError:
+        pass
     # A category is a folder, not a tag: a device can belong to one custom
     # category at most. Existing experimental rows are normalised on upgrade.
     c.execute('''DELETE FROM device_category_items WHERE rowid NOT IN
@@ -433,7 +446,10 @@ init_db()
 
 
 def fetch_nvr_channels(nvr: NVR) -> list[dict]:
-    """Pobiera listę kanałów i ich nazwy (obsługuje NVR Qualvision/TDK oraz Xiongmai NETIP)."""
+    """Pobiera listę kanałów z Hikvision ISAPI, Qualvision/TDK lub Xiongmai NETIP."""
+    hikvision_channels = fetch_hikvision_channels(nvr)
+    if hikvision_channels is not None:
+        return hikvision_channels
     tdk_channels = fetch_tdkcgi_channels(nvr)
     if tdk_channels is not None and len(tdk_channels) > 0:
         return tdk_channels
@@ -482,6 +498,322 @@ def fetch_nvr_channels(nvr: NVR) -> list[dict]:
             cam.close()
         except Exception:
             pass
+
+
+def xml_local_name(element: ET.Element) -> str:
+    """Return an XML tag name without its optional namespace."""
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def hikvision_isapi_get(ip: str, user: str, password: str, path: str,
+                        timeout: float = 5) -> bytes | None:
+    """Read a Hikvision ISAPI endpoint using its standard Digest authentication."""
+    url = f"http://{ip}{path}"
+    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(None, url, user, password)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPDigestAuthHandler(password_manager),
+        urllib.request.HTTPBasicAuthHandler(password_manager),
+    )
+    try:
+        with opener.open(url, timeout=timeout) as response:
+            return response.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        return None
+
+
+def hikvision_isapi_post(ip: str, user: str, password: str, path: str, payload: bytes,
+                         timeout: float = 15) -> bytes | None:
+    """POST to Hikvision ISAPI with the device's Digest authentication."""
+    url = f"http://{ip}{path}"
+    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(None, url, user, password)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPDigestAuthHandler(password_manager),
+        urllib.request.HTTPBasicAuthHandler(password_manager),
+    )
+    request = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/xml; charset=utf-8"}, method="POST")
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        return None
+
+
+def xml_descendant_text(element: ET.Element, name: str) -> str:
+    """Read a descendant regardless of the ISAPI XML namespace variant."""
+    for child in element.iter():
+        if xml_local_name(child) == name:
+            return (child.text or "").strip()
+    return ""
+
+
+def hikvision_datetime(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def hikvision_recording_token(start: datetime, end: datetime) -> str:
+    payload = f"{start.isoformat()}|{end.isoformat()}".encode("utf-8")
+    return "hikvision:" + base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def hikvision_search_recordings(ip: str, user: str, password: str, channel: int,
+                                start: datetime, end: datetime) -> list[dict]:
+    """Search archive segments through Hikvision ISAPI ContentMgmt.
+
+    Hikvision numbers the main recording track as ``channel * 100 + 1``.  The
+    search response supplies the playback URI required by its download API.
+    """
+    track_id = channel * 100 + 1
+    search_id = str(uuid4())
+    start_iso, end_iso = (value.strftime("%Y-%m-%dT%H:%M:%SZ") for value in (start, end))
+    body = f'''<?xml version="1.0" encoding="UTF-8"?>
+<CMSearchDescription version="1.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+  <searchID>{search_id}</searchID>
+  <trackIDList><trackID>{track_id}</trackID></trackIDList>
+  <timeSpanList><timeSpan><startTime>{start_iso}</startTime><endTime>{end_iso}</endTime></timeSpan></timeSpanList>
+  <contentTypeList><contentType>video</contentType></contentTypeList>
+  <maxResults>1000</maxResults><searchResultPostion>0</searchResultPostion>
+</CMSearchDescription>'''.encode("utf-8")
+    payload = hikvision_isapi_post(ip, user, password, "/ISAPI/ContentMgmt/search", body, timeout=20)
+    if not payload:
+        raise ArchiveError("Rejestrator Hikvision nie odpowiedział na wyszukiwanie archiwum.")
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError as exc:
+        raise ArchiveError("Hikvision zwrócił nieprawidłową odpowiedź archiwum.") from exc
+    status = xml_descendant_text(root, "responseStatusStrg").upper()
+    if status in {"NO MATCHES", "NO MATCH"}:
+        return []
+    if status and status not in {"OK", "MORE"}:
+        raise ArchiveError(f"Hikvision odrzucił wyszukiwanie archiwum ({status}).")
+    results = []
+    for item in root.iter():
+        if xml_local_name(item) != "searchMatchItem":
+            continue
+        start_at = hikvision_datetime(xml_descendant_text(item, "startTime"))
+        end_at = hikvision_datetime(xml_descendant_text(item, "endTime"))
+        playback_uri = xml_descendant_text(item, "playbackURI")
+        if not start_at or not end_at or end_at <= start_at or not playback_uri:
+            continue
+        results.append({"start": start_at, "end": end_at, "playback_uri": playback_uri,
+                        "filename": hikvision_recording_token(start_at, end_at)})
+    return sorted(results, key=lambda item: item["start"])
+
+
+def hikvision_search_all_recordings(ip: str, user: str, password: str, channel: int,
+                                    start: datetime, end: datetime) -> list[dict]:
+    """Search every segment, splitting ranges which hit the NVR's result cap."""
+    segments = hikvision_search_recordings(ip, user, password, channel, start, end)
+    if len(segments) >= HIKVISION_SEARCH_RESULT_LIMIT and end - start > timedelta(minutes=1):
+        midpoint = start + (end - start) / 2
+        # ISAPI uses whole-second timestamps; a precise midpoint avoids gaps
+        # and duplicate result pages while preserving the complete interval.
+        midpoint = midpoint.replace(microsecond=0)
+        if midpoint > start and midpoint < end:
+            segments = [
+                *hikvision_search_all_recordings(ip, user, password, channel, start, midpoint),
+                *hikvision_search_all_recordings(ip, user, password, channel, midpoint, end),
+            ]
+    unique = {item["filename"]: item for item in segments}
+    return sorted(unique.values(), key=lambda item: item["start"])
+
+
+def hikvision_recording_files(ip: str, user: str, password: str, channel: int, date: str) -> list[dict]:
+    day_start = datetime.strptime(date, "%Y-%m-%d")
+    segments = hikvision_search_recordings(ip, user, password, channel, day_start,
+                                           day_start + timedelta(days=1))
+    files = []
+    for index, segment in enumerate(segments, start=1):
+        duration = round((segment["end"] - segment["start"]).total_seconds())
+        files.append({
+            "filename": segment["filename"],
+            "start_time": segment["start"].strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": segment["end"].strftime("%Y-%m-%d %H:%M:%S"),
+            "time_only_start": segment["start"].strftime("%H:%M:%S"),
+            "time_only_end": segment["end"].strftime("%H:%M:%S"),
+            "duration_seconds": duration,
+            "duration_formatted": str(timedelta(seconds=duration)),
+            "size_kb": 0, "size_mb": 0, "index": index,
+        })
+    return files
+
+
+def select_hikvision_recordings(ip: str, user: str, password: str, channel: int, date: str,
+                                filename: str | None, start_time: str, end_time: str) -> list[dict]:
+    day_start = datetime.strptime(date, "%Y-%m-%d")
+    begin = datetime.fromisoformat(f"{date}T{start_time}")
+    finish = datetime.fromisoformat(f"{date}T{end_time}")
+    matches = hikvision_search_recordings(ip, user, password, channel, day_start,
+                                           day_start + timedelta(days=1))
+    if filename:
+        matches = [item for item in matches if item["filename"] == filename]
+        if not matches:
+            raise HTTPException(status_code=404, detail="Wybrany plik nie jest już dostępny w archiwum Hikvision.")
+        return matches
+    # A new search for the exact requested range gives the recorder a
+    # playback URI whose embedded name/size remain valid for download.
+    selected = hikvision_search_recordings(ip, user, password, channel, begin, finish)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Brak nagrań w wybranym zakresie.")
+    # ISAPI download is based on a single returned playback URI. Do not merge
+    # unrelated archive fragments: the UI supplies one file at a time.
+    if len(selected) > 1:
+        raise HTTPException(status_code=422,
+                            detail="Wybrany zakres obejmuje kilka segmentów Hikvision. Pobierz je osobno z listy.")
+    return selected
+
+
+def hikvision_playback_uri_for_span(playback_uri: str, start: datetime, end: datetime) -> str:
+    """Constrain a returned ISAPI playback URI to the requested interval."""
+    parts = urllib.parse.urlsplit(playback_uri)
+    query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    replacements = {
+        "starttime": start.strftime("%Y%m%dT%H%M%SZ"),
+        "endtime": end.strftime("%Y%m%dT%H%M%SZ"),
+    }
+    updated, seen = [], set()
+    for key, value in query:
+        lower = key.lower()
+        if lower in replacements:
+            updated.append((key, replacements[lower]))
+            seen.add(lower)
+        else:
+            updated.append((key, value))
+    for key, value in replacements.items():
+        if key not in seen:
+            updated.append((key, value))
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                    urllib.parse.urlencode(updated), parts.fragment))
+
+
+def hikvision_download_video(ip: str, user: str, password: str, playback_uri: str,
+                             target: Path, is_cancelled=None) -> tuple[str, float, int]:
+    """Download a Hikvision archive segment returned by ISAPI search.
+
+    The ``ContentMgmt/download`` endpoint returns a media container; FFmpeg is
+    subsequently used in container mode, preserving the user's output choice.
+    """
+    url = f"http://{ip}/ISAPI/ContentMgmt/download"
+    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(None, url, user, password)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPDigestAuthHandler(password_manager),
+        urllib.request.HTTPBasicAuthHandler(password_manager),
+    )
+    payload = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+               "<downloadRequest version=\"1.0\" xmlns=\"http://www.isapi.org/ver20/XMLSchema\">"
+               f"<playbackURI>{html.escape(playback_uri)}</playbackURI>"
+               "</downloadRequest>").encode("utf-8")
+    request = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/xml; charset=utf-8"}, method="POST")
+    total = 0
+    limit = int(os.environ.get("ARCHIVE_MAX_BYTES", str(4 * 1024**3)))
+    try:
+        with opener.open(request, timeout=30) as response, target.open("wb") as output:
+            while True:
+                if is_cancelled and is_cancelled():
+                    raise ArchiveCancelled("Pobieranie materiału zostało anulowane przez użytkownika.")
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ArchiveError("Nagranie przekracza limit rozmiaru. Wybierz krótszy zakres.")
+                output.write(chunk)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        raise ArchiveError("Nie udało się pobrać nagrania z Hikvision przez ISAPI.") from exc
+    if total == 0:
+        raise ArchiveError("Hikvision nie zwrócił danych nagrania.")
+    # The container input does not need an exact rate for copy/remux; it is
+    # retained for code paths which request re-encoding.
+    return "h264", 25.0, 1
+
+
+def fetch_hikvision_channels(nvr: NVR) -> list[dict] | None:
+    """List IP-input channels exposed by a Hikvision recorder through ISAPI.
+
+    ``None`` means that the endpoint is not available, allowing the legacy
+    recorder protocols to be tried. An empty list is a valid ISAPI response
+    from a recorder with no connected cameras.
+    """
+    payload = hikvision_isapi_get(nvr.ip, nvr.user, nvr.password,
+                                  "/ISAPI/ContentMgmt/InputProxy/channels", timeout=2)
+    if not payload:
+        return None
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return None
+    if xml_local_name(root) != "InputProxyChannelList":
+        return None
+    HIKVISION_NVR_CACHE[(nvr.ip, nvr.user)] = (time.time(), True)
+
+    channels: list[dict] = []
+    for item in root.iter():
+        if xml_local_name(item) != "InputProxyChannel":
+            continue
+        values = {xml_local_name(child): (child.text or "").strip() for child in item}
+        try:
+            channel_number = int(values.get("id", ""))
+        except ValueError:
+            continue
+        channels.append({"channel_number": channel_number,
+                         "name": values.get("name") or f"Kanał {channel_number}"})
+    return channels
+
+
+def hikvision_device_kind(ip: str, user: str, password: str) -> str | None:
+    """Use Hikvision's deviceInfo endpoint to distinguish camera from NVR."""
+    if not user:
+        return None
+    payload = hikvision_isapi_get(ip, user, password, "/ISAPI/System/deviceInfo", timeout=2)
+    if not payload:
+        return None
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return None
+    values = " ".join((element.text or "") for element in root.iter()).lower()
+    if any(marker in values for marker in ("ipcamera", "ip camera", "network camera")):
+        return "camera"
+    if any(marker in values for marker in ("nvr", "network video recorder", "digital video recorder")):
+        return "nvr"
+    return None
+
+
+def is_hikvision_nvr(ip: str, user: str, password: str) -> bool:
+    """Recognise a Hikvision recorder once and cache the result briefly."""
+    key = (ip, user)
+    cached = HIKVISION_NVR_CACHE.get(key)
+    now = time.time()
+    if cached and now - cached[0] < 300:
+        return cached[1]
+    payload = hikvision_isapi_get(ip, user, password, "/ISAPI/ContentMgmt/InputProxy/channels")
+    try:
+        result = bool(payload and xml_local_name(ET.fromstring(payload)) == "InputProxyChannelList")
+    except ET.ParseError:
+        result = False
+    HIKVISION_NVR_CACHE[key] = (now, result)
+    return result
+
+
+def hikvision_rtsp_path(channel: int, stream: int) -> str:
+    """Return the documented Hikvision RTSP path for a recorder channel."""
+    profile = 1 if stream == 1 else 2
+    return f"/Streaming/Channels/{channel}0{profile}"
+
+
+def nvr_rtsp_url(ip: str, user: str, password: str, channel: int, stream: int,
+                 hikvision: bool) -> str:
+    u_enc = urllib.parse.quote(user, safe="")
+    p_enc = urllib.parse.quote(password, safe="")
+    path = hikvision_rtsp_path(channel, stream) if hikvision else f"/mode=real&idc={channel}&ids={stream}"
+    return f"rtsp://{u_enc}:{p_enc}@{ip}:554{path}#media=video"
 
 
 NVR_CHANNEL_CONFIGS_CACHE: dict[int, tuple[float, dict[int, dict]]] = {}
@@ -549,16 +881,14 @@ def ensure_go2rtc_stream(dvr_id: int, channel: int, stream: int = 2) -> str:
         raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora w bazie.")
 
     ip, port, user, password = row
-    u_enc = urllib.parse.quote(user, safe="")
-    p_enc = urllib.parse.quote(password, safe="")
-
     stream_id = stream if stream in (1, 2) else 2
-    rtsp_qv = f"rtsp://{u_enc}:{p_enc}@{ip}:554/mode=real&idc={channel}&ids={stream_id}#media=video"
+    hikvision = is_hikvision_nvr(ip, user, password)
+    rtsp_qv = nvr_rtsp_url(ip, user, password, channel, stream_id, hikvision)
     stream_name = f"nvr_{dvr_id}_ch_{channel}_s_{stream_id}"
 
     # Prefer direct camera connection if channel is mapped to a known camera on the LAN
     direct_rtsp = None
-    cam_cfg = get_nvr_channel_camera_config(dvr_id, channel)
+    cam_cfg = None if hikvision else get_nvr_channel_camera_config(dvr_id, channel)
     if cam_cfg and cam_cfg.get("enabled", True) and cam_cfg.get("ip"):
         cam_ip = cam_cfg["ip"]
         cam_user = urllib.parse.quote(cam_cfg.get("user") or "", safe="")
@@ -618,6 +948,9 @@ def camera_rtsp_path_for_stream(path: str, stream: int) -> str:
     """
     if stream != 1:
         return path
+    if re.search(r"/Streaming/Channels/\d+02(?:$|[/?])", path, re.I):
+        return re.sub(r"(Streaming/Channels/\d+)02(?=$|[/?])", r"\g<1>01", path,
+                      count=1, flags=re.I)
     return re.sub(r"([?&]ids=)2(?=(&|$))", r"\g<1>1", path, count=1)
 
 
@@ -643,18 +976,42 @@ def http_device_vendor(ip: str) -> str | None:
     not change the discovery result. HTTP 401 pages are useful too because
     they commonly include the same vendor banner.
     """
+    return vendor_from_http_fingerprint(http_device_fingerprint(ip))
+
+
+def http_device_fingerprint(ip: str) -> str:
+    """Return public HTTP metadata without requiring device credentials."""
     try:
         with urllib.request.urlopen(f"http://{ip}/", timeout=3) as response:
-            fingerprint = response.headers.get("Server", "") + "\n" + response.read(32768).decode("utf-8", "ignore")
+            return response.headers.get("Server", "") + "\n" + response.read(32768).decode("utf-8", "ignore")
     except urllib.error.HTTPError as exc:
         fingerprint = exc.headers.get("Server", "")
         try:
-            fingerprint += "\n" + exc.read(32768).decode("utf-8", "ignore")
+            return fingerprint + "\n" + exc.read(32768).decode("utf-8", "ignore")
         except OSError:
-            pass
+            return fingerprint
     except (urllib.error.URLError, TimeoutError, OSError):
-        return None
-    return vendor_from_http_fingerprint(fingerprint)
+        return ""
+
+
+def hikvision_web_kind(ip: str, fingerprint: str | None = None) -> str | None:
+    """Recognise Hikvision camera/NVR web UIs before credentials are entered.
+
+    The legacy NVR interface uses the ``/doc/page/`` application (including
+    ``playback.asp``); current standalone cameras use ``/doc/index.html``.
+    This only supplies a type when a Hikvision-specific marker is present, so
+    generic web pages are never promoted to recorders.
+    """
+    fingerprint = (fingerprint if fingerprint is not None else http_device_fingerprint(ip)).lower()
+    if any(marker in fingerprint for marker in (
+        "network video recorder", "digital video recorder", "/doc/page/", "playback.asp",
+    )):
+        return "nvr"
+    if any(marker in fingerprint for marker in (
+        "ip camera", "ipcamera", "network camera", "/doc/index.html",
+    )):
+        return "camera"
+    return None
 
 
 def camera_vendor(ip: str) -> str | None:
@@ -670,7 +1027,17 @@ def detect_camera_rtsp_path(ip: str, current_path: str = "/") -> str:
         # Qualvision/TDK and Kenik use the same channel-style RTSP endpoint
         # for an independent camera; channel 1 and substream are the safe default.
         return "/mode=real&idc=1&ids=2"
+    if camera_vendor(ip) == "Hikvision":
+        # Hikvision documents channel 1 / substream as 102 (101 is main).
+        return "/Streaming/Channels/102"
     return current_path
+
+
+def camera_vendor_from_rtsp_path(path: str) -> str | None:
+    """Keep the saved-device label useful without probing every camera on refresh."""
+    if "/streaming/channels/" in (path or "").lower():
+        return "Hikvision"
+    return None
 
 
 def camera_connection_from_registered_nvr(ip: str) -> tuple[str, str, str] | None:
@@ -922,7 +1289,7 @@ def classify_host(ip: str, ports: set[int], ws_types: str = "") -> str:
     # legacy media port without that camera service.
     if 554 in ports and 5801 in ports and 34567 in ports:
         return "nvr"
-    if 554 in ports and (443 in ports or 8000 in ports):
+    if 554 in ports and 443 in ports:
         return "nvr"
     if 554 in ports:
         return "camera"
@@ -1038,7 +1405,7 @@ def known_device_network_targets(limit: int = 1024) -> list[str]:
 
 def known_device_networks() -> list[ipaddress.IPv4Network]:
     """Return /24s inferred from saved devices, without expanding them yet."""
-    conn = sqlite3.connect("data/dvrs.db")
+    conn = sqlite3.connect("data/dvrs.db", timeout=0.2)
     try:
         ips = [row[0] for row in conn.execute("SELECT ip FROM dvrs UNION SELECT ip FROM cameras")]
     finally:
@@ -1055,7 +1422,7 @@ def known_device_networks() -> list[ipaddress.IPv4Network]:
 
 
 def saved_discovery_networks() -> list[ipaddress.IPv4Network]:
-    conn = sqlite3.connect("data/dvrs.db")
+    conn = sqlite3.connect("data/dvrs.db", timeout=0.2)
     try:
         rows = conn.execute("SELECT cidr FROM discovery_networks").fetchall()
     finally:
@@ -1098,7 +1465,7 @@ def scan_host(ip: str, user: str = "", password: str = "", known_nvr: bool = Fal
                      34567, 37777, 37778, 49152)
     for port in ports_to_test:
         try:
-            with socket.create_connection((ip, port), timeout=0.35):
+            with socket.create_connection((ip, port), timeout=0.2):
                 open_ports.add(port)
         except OSError:
             pass
@@ -1107,11 +1474,17 @@ def scan_host(ip: str, user: str = "", password: str = "", known_nvr: bool = Fal
     # HTTP/HTTPS alone identifies far too many unrelated devices (routers,
     # printers, switches). Keep discovery results limited to hosts exposing a
     # CCTV/ONVIF/native-video service; HTTP is used only as a vendor hint.
-    cctv_ports = {554, 8899, 34567, 37777, 37778, 49152}
+    cctv_ports = {554, 8000, 8899, 34567, 37777, 37778, 49152}
     if not open_ports.intersection(cctv_ports):
         return None
+    http_fingerprint = http_device_fingerprint(ip) if 80 in open_ports else ""
+    vendor = vendor_from_http_fingerprint(http_fingerprint)
     kind = classify_host(ip, open_ports)
     channels_count: int | None = None
+    detected_hikvision_kind = hikvision_web_kind(ip, http_fingerprint) if http_fingerprint else None
+    if detected_hikvision_kind:
+        vendor = "Hikvision"
+        kind = detected_hikvision_kind
     # The XM NETIP service (34567) is shared by cameras and recorders, so it
     # is not a type marker. A successful authenticated channel inventory is.
     if known_nvr:
@@ -1122,11 +1495,27 @@ def scan_host(ip: str, user: str = "", password: str = "", known_nvr: bool = Fal
             kind = "nvr" if channels_count > 1 else "camera"
         except (HTTPException, OSError):
             pass
-    vendor = http_device_vendor(ip) if 80 in open_ports else None
-    rtsp_path = "/mode=real&idc=1&ids=2" if vendor in {"Qualvision", "Kenik"} else "/"
+    if user and 8000 in open_ports:
+        # Hikvision uses port 8000 on both cameras and NVRs. Its recorder
+        # endpoint returns the actual channel inventory, unlike port guessing.
+        hikvision_channels = fetch_hikvision_channels(
+            NVR(name="", ip=ip, port=8000, user=user, password=password))
+        if hikvision_channels is not None:
+            vendor = "Hikvision"
+            kind = "nvr"
+            channels_count = len(hikvision_channels)
+    if vendor == "Hikvision" and kind != "nvr":
+        # Port 8000 is used by both Hikvision cameras and recorders. ISAPI is
+        # authoritative when credentials were supplied; otherwise prefer the
+        # safer camera classification instead of adding an IP camera as NVR.
+        kind = hikvision_device_kind(ip, user, password) or detected_hikvision_kind or "camera"
+    rtsp_path = ("/mode=real&idc=1&ids=2" if vendor in {"Qualvision", "Kenik"}
+                 else "/Streaming/Channels/102" if vendor == "Hikvision" else "/")
     name_prefix = f"{('Rejestrator' if kind == 'nvr' else 'Kamera')} {vendor}" if vendor else ('Rejestrator' if kind == 'nvr' else 'Kamera')
     return {"ip": ip, "type": kind, "name": f"{name_prefix} {ip}",
-            "port": 34567 if kind == "nvr" and 34567 in open_ports else (554 if 554 in open_ports else min(open_ports)),
+            "port": (34567 if kind == "nvr" and 34567 in open_ports
+                     else 8000 if kind == "nvr" and 8000 in open_ports
+                     else 554 if 554 in open_ports else min(open_ports)),
             "ports": sorted(open_ports), "channels_count": channels_count, "vendor": vendor,
             "rtsp_path": rtsp_path, "method": "Skan IP"}
 
@@ -1253,18 +1642,30 @@ def full_local_scan_networks() -> list[ipaddress.IPv4Network]:
 
 
 def discovery_network_candidates() -> list[dict]:
-    """Build a compact, editable chooser covering all private IPv4 ranges."""
+    """Build a compact, editable chooser covering all private IPv4 ranges.
+
+    This endpoint feeds a modal dialog, so an unrelated writer holding the
+    SQLite file must never leave its UI waiting. Saved network hints are
+    optional; the three standard private ranges are always available.
+    """
     configured = {str(network) for network in configured_discovery_networks()}
-    known = {str(network) for network in [*known_device_networks(), *saved_discovery_networks()]}
-    conn = sqlite3.connect("data/dvrs.db")
     try:
-        preferences = {cidr: (bool(enabled), bool(hidden), bool(custom)) for cidr, enabled, hidden, custom in
-                       conn.execute("SELECT cidr, enabled, hidden, custom FROM discovery_scan_networks").fetchall()}
-    finally:
-        conn.close()
+        known_networks = [*known_device_networks(), *saved_discovery_networks()]
+    except sqlite3.Error:
+        known_networks = []
+    known = {str(network) for network in known_networks}
+    try:
+        conn = sqlite3.connect("data/dvrs.db", timeout=0.2)
+        try:
+            preferences = {cidr: (bool(enabled), bool(hidden), bool(custom)) for cidr, enabled, hidden, custom in
+                           conn.execute("SELECT cidr, enabled, hidden, custom FROM discovery_scan_networks").fetchall()}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        preferences = {}
     base = [ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
     candidates = {str(network): network for network in [*base, *configured_discovery_networks(),
-                  *known_device_networks(), *saved_discovery_networks()]}
+                  *known_networks]}
     for cidr, (_, _, custom) in preferences.items():
         if not custom:
             continue
@@ -1348,10 +1749,8 @@ def get_rtsp_url_for_stream(stream_name: str) -> str | None:
                 conn.close()
             if row:
                 ip, port, user, password = row
-                u_enc = urllib.parse.quote(user or "", safe="")
-                p_enc = urllib.parse.quote(password or "", safe="")
-                credentials = f"{u_enc}:{p_enc}@" if user or password else ""
-                clean_url = f"rtsp://{credentials}{ip}:554/mode=real&idc={ch}&ids={stream_id}"
+                clean_url = nvr_rtsp_url(ip, user, password, ch, stream_id,
+                                         is_hikvision_nvr(ip, user, password)).split("#")[0]
                 STREAM_RTSP_SOURCES[stream_name] = clean_url
                 return clean_url
     except Exception:
@@ -1472,7 +1871,7 @@ async def get_session(request: Request):
 
 
 @app.get("/api/dvrs")
-async def get_dvrs():
+def get_dvrs():
     conn = sqlite3.connect('data/dvrs.db')
     c = conn.cursor()
     c.execute("SELECT id, name, ip, port FROM dvrs")
@@ -1499,7 +1898,7 @@ async def get_dvrs():
 
 
 @app.get("/api/dvrs/{dvr_id}/channels")
-async def get_dvr_channels(dvr_id: int):
+def get_dvr_channels(dvr_id: int):
     conn = sqlite3.connect('data/dvrs.db')
     c = conn.cursor()
     c.execute(
@@ -1512,7 +1911,7 @@ async def get_dvr_channels(dvr_id: int):
 
 
 @app.get("/api/dvrs/status")
-async def get_dvr_channel_status():
+def get_dvr_channel_status():
     """Return the current NVR-reported state; it is never persisted."""
     conn = sqlite3.connect("data/dvrs.db")
     try:
@@ -1522,6 +1921,10 @@ async def get_dvr_channel_status():
 
     result: dict[str, dict[str, bool]] = {}
     for dvr_id, ip, port, user, password in rows:
+        if port == 8000 and is_hikvision_nvr(ip, user, password):
+            # Hikvision does not understand the legacy TDK status command.
+            # Skipping it prevents one slow timeout for every UI refresh.
+            continue
         statuses = fetch_tdkcgi_channel_status(
             NVR(name="", ip=ip, port=port, user=user, password=password)
         )
@@ -1531,20 +1934,21 @@ async def get_dvr_channel_status():
 
 
 @app.post("/api/dvrs/test")
-async def test_dvr_connection(nvr: NVR):
+def test_dvr_connection(nvr: NVR):
     channels = fetch_nvr_channels(nvr)
     return {"status": "ok", "channels_count": len(channels), "channels": channels}
 
 
 @app.post("/api/dvrs")
-async def add_dvr(nvr: NVR):
+def add_dvr(nvr: NVR):
     channels = fetch_nvr_channels(nvr)
+    vendor = nvr.vendor or ("Hikvision" if is_hikvision_nvr(nvr.ip, nvr.user, nvr.password) else None)
 
     conn = sqlite3.connect('data/dvrs.db')
     c = conn.cursor()
     c.execute(
-        "INSERT INTO dvrs (name, ip, port, user, password) VALUES (?, ?, ?, ?, ?)",
-        (nvr.name, nvr.ip, nvr.port, nvr.user, nvr.password)
+        "INSERT INTO dvrs (name, ip, port, user, password, vendor) VALUES (?, ?, ?, ?, ?, ?)",
+        (nvr.name, nvr.ip, nvr.port, nvr.user, nvr.password, vendor)
     )
     dvr_id = c.lastrowid
 
@@ -1772,8 +2176,9 @@ def update_dvr(dvr_id: int, update: NVRUpdate):
         nvr = NVR(name=update.name, ip=update.ip, port=update.port, user=update.user,
                   password=update.password or current[0])
         channels = fetch_nvr_channels(nvr)
-        conn.execute("UPDATE dvrs SET name = ?, ip = ?, port = ?, user = ?, password = ? WHERE id = ?",
-                     (nvr.name, nvr.ip, nvr.port, nvr.user, nvr.password, dvr_id))
+        vendor = update.vendor or ("Hikvision" if is_hikvision_nvr(nvr.ip, nvr.user, nvr.password) else None)
+        conn.execute("UPDATE dvrs SET name = ?, ip = ?, port = ?, user = ?, password = ?, vendor = ? WHERE id = ?",
+                     (nvr.name, nvr.ip, nvr.port, nvr.user, nvr.password, vendor, dvr_id))
         conn.execute("DELETE FROM channels WHERE dvr_id = ?", (dvr_id,))
         conn.executemany("INSERT INTO channels (dvr_id, channel_number, name) VALUES (?, ?, ?)",
                          [(dvr_id, channel["channel_number"], channel["name"]) for channel in channels])
@@ -1956,11 +2361,12 @@ def clean_cache():
 def get_devices():
     conn = sqlite3.connect("data/dvrs.db")
     try:
-        rows = conn.execute("SELECT id, name, ip, port FROM dvrs ORDER BY name").fetchall()
-        devices = [{"id": r[0], "type": "nvr", "name": r[1], "ip": r[2], "port": r[3],
+        rows = conn.execute("SELECT id, name, ip, port, vendor FROM dvrs ORDER BY name").fetchall()
+        devices = [{"id": r[0], "type": "nvr", "name": r[1], "ip": r[2], "port": r[3], "vendor": r[4],
                     "channels_count": conn.execute("SELECT COUNT(*) FROM channels WHERE dvr_id = ?", (r[0],)).fetchone()[0]} for r in rows]
-        devices += [{"id": r[0], "type": "camera", "name": r[1], "ip": r[2], "port": r[3], "channels_count": 1}
-                    for r in conn.execute("SELECT id, name, ip, port FROM cameras ORDER BY name").fetchall()]
+        devices += [{"id": r[0], "type": "camera", "name": r[1], "ip": r[2], "port": r[3],
+                     "channels_count": 1, "vendor": camera_vendor_from_rtsp_path(r[4])}
+                    for r in conn.execute("SELECT id, name, ip, port, rtsp_path FROM cameras ORDER BY name").fetchall()]
         memberships = conn.execute("SELECT category_id, device_type, device_id FROM device_category_items").fetchall()
         categories = [{"id": r[0], "name": r[1], "hidden": bool(r[2]), "system": r[3] == "all", "device_keys": []}
                       for r in conn.execute("SELECT id, name, hidden, system_key FROM device_categories ORDER BY system_key DESC, name").fetchall()]
@@ -2374,7 +2780,7 @@ def validate_recording_request(date: str, filename: str | None, start_time: str 
         end = datetime.strptime(end_time or "23:59:59", "%H:%M:%S")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Nieprawidłowy format daty lub godziny nagrania.") from exc
-    if filename:
+    if filename and not filename.startswith("hikvision:"):
         try:
             Recording.parse(filename)
         except ArchiveError as exc:
@@ -2389,13 +2795,30 @@ def get_recording_days(dvr_id: int, channel: int, year: int, month: int):
     """Zwraca listę dni w podanym miesiącu i roku, dla których na danym kanale istnieją nagrania."""
     conn = sqlite3.connect("data/dvrs.db")
     c = conn.cursor()
-    c.execute("SELECT ip, user, password FROM dvrs WHERE id = ?", (dvr_id,))
+    c.execute("SELECT ip, user, password, vendor FROM dvrs WHERE id = ?", (dvr_id,))
     row = c.fetchone()
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora w bazie.")
 
-    ip, user, password = row
+    ip, user, password = row[:3]
+    vendor = row[3] if len(row) > 3 else None
+    if vendor == "Hikvision" or is_hikvision_nvr(ip, user, password):
+        month_start = datetime(year, month, 1)
+        month_end = datetime(year + (month == 12), 1 if month == 12 else month + 1, 1)
+        segments = hikvision_search_all_recordings(ip, user, password, channel, month_start, month_end)
+        days = set()
+        for segment in segments:
+            day = max(segment["start"], month_start).date()
+            last_day = min(segment["end"] - timedelta(microseconds=1), month_end - timedelta(microseconds=1)).date()
+            while day <= last_day:
+                if day.year == year and day.month == month:
+                    days.add(day.day)
+                day += timedelta(days=1)
+        return {
+            "dvr_id": dvr_id, "channel": channel, "year": year, "month": month,
+            "days": sorted(days),
+        }
     # Despite its name, this CGI field takes a channel number, not a bit mask.
     channel_mask = channel
     content = (
@@ -2432,13 +2855,17 @@ def get_recording_files(dvr_id: int, channel: int, date: str):
     """Pobiera listę plików nagrań dla wybranego kontrolera, kanału i daty (YYYY-MM-DD)."""
     conn = sqlite3.connect("data/dvrs.db")
     c = conn.cursor()
-    c.execute("SELECT ip, user, password FROM dvrs WHERE id = ?", (dvr_id,))
+    c.execute("SELECT ip, user, password, vendor FROM dvrs WHERE id = ?", (dvr_id,))
     row = c.fetchone()
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Nie znaleziono rejestratora w bazie.")
 
-    ip, user, password = row
+    ip, user, password = row[:3]
+    vendor = row[3] if len(row) > 3 else None
+    if vendor == "Hikvision" or is_hikvision_nvr(ip, user, password):
+        return {"files": hikvision_recording_files(ip, user, password, channel, date),
+                "date": date, "channel": channel, "dvr_id": dvr_id}
     cnt_session = (
         f"<record>"
         f"<filetype>video</filetype>"
@@ -2805,44 +3232,58 @@ def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time
         raise HTTPException(status_code=422, detail="Nieprawidłowy format lub jakość nagrania.")
     _, ip, port, user, password = get_recording_dvr(dvr_id)
     start_time, end_time = validate_recording_request(date, filename, start_time, end_time)
-    available = get_recording_files(dvr_id, channel, date)["files"]
-    if filename:
-        matches = [item for item in available if item["filename"] == filename]
-        if not matches:
-            raise HTTPException(status_code=404, detail="Wybrany plik nie jest już dostępny w archiwum.")
-        recording = Recording.parse(filename)
-        if recording.channel != channel:
-            raise HTTPException(status_code=422, detail="Plik nie należy do wybranej kamery.")
-        selections = [(recording, recording.start, recording.end)]
-    else:
-        begin = datetime.fromisoformat(f"{date}T{start_time}")
-        finish = datetime.fromisoformat(f"{date}T{end_time}")
+    hikvision = is_hikvision_nvr(ip, user, password)
+    if hikvision:
+        hikvision_selections = select_hikvision_recordings(ip, user, password, channel, date,
+                                                            filename, start_time, end_time)
         selections = []
-        for item in available:
-            recording = Recording.parse(item["filename"])
+    else:
+        hikvision_selections = []
+        available = get_recording_files(dvr_id, channel, date)["files"]
+        if filename:
+            matches = [item for item in available if item["filename"] == filename]
+            if not matches:
+                raise HTTPException(status_code=404, detail="Wybrany plik nie jest już dostępny w archiwum.")
+            recording = Recording.parse(filename)
             if recording.channel != channel:
-                continue
-            left, right = max(begin, recording.start), min(finish, recording.end)
-            if left < right:
-                selections.append((recording, left, right))
-        selections.sort(key=lambda selection: selection[1])
-        unique, covered_until = [], begin
-        for recording, left, right in selections:
-            left = max(left, covered_until)
-            if left < right:
-                unique.append((recording, left, right))
-                covered_until = right
-        selections = unique
-    if not selections:
-        raise HTTPException(status_code=404, detail="Brak nagrań w wybranym zakresie.")
+                raise HTTPException(status_code=422, detail="Plik nie należy do wybranej kamery.")
+            selections = [(recording, recording.start, recording.end)]
+        else:
+            begin = datetime.fromisoformat(f"{date}T{start_time}")
+            finish = datetime.fromisoformat(f"{date}T{end_time}")
+            selections = []
+            for item in available:
+                recording = Recording.parse(item["filename"])
+                if recording.channel != channel:
+                    continue
+                left, right = max(begin, recording.start), min(finish, recording.end)
+                if left < right:
+                    selections.append((recording, left, right))
+            selections.sort(key=lambda selection: selection[1])
+            unique, covered_until = [], begin
+            for recording, left, right in selections:
+                left = max(left, covered_until)
+                if left < right:
+                    unique.append((recording, left, right))
+                    covered_until = right
+            selections = unique
+        if not selections:
+            raise HTTPException(status_code=404, detail="Brak nagrań w wybranym zakresie.")
 
     scratch = Path("data/archive-jobs")
     scratch.mkdir(parents=True, exist_ok=True)
     folder = Path(tempfile.mkdtemp(prefix="download-", dir=scratch))
     try:
-        source = folder / "source.video"
+        source = folder / ("source.mp4" if hikvision else "source.video")
         report("Pobieranie materiału z rejestratora", 5)
-        codec, fps, _ = save_video(ip, port, user, password, selections, source, is_cancelled=is_cancelled)
+        if hikvision:
+            selection = hikvision_selections[0]
+            codec, fps, _ = hikvision_download_video(ip, user, password, selection["playback_uri"],
+                                                      source, is_cancelled=is_cancelled)
+            selection_start, selection_end = selection["start"], selection["end"]
+        else:
+            codec, fps, _ = save_video(ip, port, user, password, selections, source, is_cancelled=is_cancelled)
+            selection_start, selection_end = selections[0][1], selections[-1][2]
         if is_cancelled and is_cancelled():
             raise ArchiveCancelled("Pobieranie materiału zostało anulowane przez użytkownika.")
         target_fps = float(fps_choice) if fps_choice in ("15", "10") else None
@@ -2851,6 +3292,7 @@ def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time
         if anonymize:
             report("Przygotowanie materiału HQ do anonimizacji", 35)
             convert_video(source, detector_input, codec, fps, quality="original",
+                          source_is_container=hikvision,
                           target_fps=target_fps if (target_fps and target_fps < fps) else None)
             if is_cancelled and is_cancelled():
                 raise ArchiveCancelled("Pobieranie materiału zostało anulowane przez użytkownika.")
@@ -2868,10 +3310,10 @@ def build_queued_recording(dvr_id, channel, date, filename, start_time, end_time
             report("Kodowanie pliku wynikowego", 65)
         result = folder / f"recording.{output_format}"
         convert_video(input_file, result, input_codec, eff_fps, quality=quality,
-                      source_is_container=anonymize,
+                      source_is_container=anonymize or hikvision,
                       target_fps=target_fps if (not anonymize and target_fps and target_fps < fps) else None)
-        result_name = (f"nvr-{dvr_id}-kamera-{channel}-{selections[0][1]:%Y-%m-%d_%H-%M-%S}_"
-                       f"{selections[-1][2]:%H-%M-%S}.{output_format}")
+        result_name = (f"nvr-{dvr_id}-kamera-{channel}-{selection_start:%Y-%m-%d_%H-%M-%S}_"
+                       f"{selection_end:%H-%M-%S}.{output_format}")
         return folder, result, result_name
     except Exception:
         shutil.rmtree(folder, ignore_errors=True)
